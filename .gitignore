@@ -1,0 +1,32 @@
+# Dependencies / local junk
+node_modules/
+.npm/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Wrangler
+.wrangler/
+.dev.vars
+.dev.vars.*
+.mf/
+
+# Real deploy config (copy from wrangler.toml.example)
+wrangler.toml
+wrangler.toml.local
+wrangler.*.local.toml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+*.log
+
+# Local bench / temp
+_matrix*
+*_bench*
+/tmp/
+*.bin

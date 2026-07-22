@@ -1,0 +1,38 @@
+# Example Wrangler config — copy to wrangler.toml.local (gitignored) for deploy.
+#   cp wrangler.toml.example wrangler.toml.local
+#   # edit wrangler.toml.local
+#   npx wrangler secret put OSS_AKID -c wrangler.toml.local
+#   npx wrangler deploy -c wrangler.toml.local
+#
+# Never put AccessKey Secret or real credentials in any committed file.
+# OSS_AKID (AccessKey Id only) must be a Worker secret, not a [vars] entry.
+
+name = "storage"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Bind custom hostnames in the Cloudflare dashboard (e.g. storage.example.com).
+
+[vars]
+# --- Object storage (non-secret) ---
+# OSS bucket name
+OSS_BUCKET = "your-bucket-name"
+# Regional public endpoint host (no scheme, no bucket prefix)
+OSS_ENDPOINT = "oss-cn-hangzhou.aliyuncs.com"
+# Key prefix for all objects written by this worker
+OSS_PREFIX = "AttachFiles"
+# Optional: PostObject upload host (CDN or custom domain).
+# Empty string → https://$OSS_BUCKET.$OSS_ENDPOINT
+# Example CDN custom domain that fronts the same bucket:
+# OSS_UPLOAD_HOST = "https://upload.example.com"
+OSS_UPLOAD_HOST = ""
+
+# --- Policy signing HTTP API (your backend) ---
+# Worker calls: GET $SIGN_BACKEND/File/GetOssPolicy2Signature?userid=...&bucket=...
+# Response JSON: ["<base64-policy>","<signature>"]
+# The AccessKey *Secret* stays on that backend — never in this Worker.
+SIGN_BACKEND = "https://sign.example.com"
+
+# --- Optional: only used in GET / API docs HTML/JSON/Markdown ---
+PUBLIC_STORAGE_HOST = "https://storage.example.com"
+PUBLIC_R2_HOST = "https://media.example.com"
