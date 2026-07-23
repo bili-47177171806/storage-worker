@@ -1289,20 +1289,17 @@ async function postToOSS(c, ossKey, policy, sig, contentType, displayName, cdVal
  * Unified upload entry used by all PUT handlers.
  *
  * With OSS_AKS:
- *  - PUT_MODE=put  → PutObject only
- *  - PUT_MODE=post → PostObject with local HMAC policy (no external signer)
- *  - PUT_MODE=auto → PutObject when upload host is regional OSS; else PostObject
- *    (CDN custom domains often accept PostObject but not V1 PutObject)
+ *  - PUT_MODE=put  → PutObject only (can be slow CF→regional; use for tests)
+ *  - PUT_MODE=post → PostObject with local HMAC policy (default-ish for CF edges)
+ *  - PUT_MODE=auto → PostObject (benches: CF LAX Post ≫ Put on regional; fcdata similar)
  * Without OSS_AKS: PostObject via SIGN_BACKEND (legacy).
  */
 async function uploadObject(c, opts) {
   const { userid, ossKey, contentType, displayName, cdValue, body, bodySize } = opts;
 
-  const uploadIsRegional =
-    !c.UPLOAD_HOST || c.UPLOAD_HOST === c.OSS_HOST || c.UPLOAD_HOST.includes(".aliyuncs.com");
-  const preferPut =
-    c.AKS &&
-    (c.PUT_MODE === "put" || (c.PUT_MODE === "auto" && uploadIsRegional));
+  // CF-edge benches (LAX): regional PutObject was ~4× slower than PostObject.
+  // Only use PutObject when explicitly requested.
+  const preferPut = c.AKS && c.PUT_MODE === "put";
 
   const buffered = toUint8(body);
 
@@ -1316,7 +1313,6 @@ async function uploadObject(c, opts) {
       await drain(r);
 
       if (!buffered) return new Response(errText, { status: r.status });
-      if (c.PUT_MODE === "put") return new Response(errText, { status: r.status });
 
       const sign = await fetchSign(c, userid);
       if (!sign) return new Response(errText, { status: r.status });
