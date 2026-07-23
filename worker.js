@@ -45,29 +45,37 @@ const UUID_RE =
 
 /**
  * Required env (vars or secrets):
- *   OSS_BUCKET, OSS_ENDPOINT, OSS_AKID (secret), SIGN_BACKEND, OSS_PREFIX
+ *   OSS_BUCKET, OSS_ENDPOINT, OSS_AKID (secret), OSS_PREFIX
+ * Prefer local signing (no external policy service):
+ *   OSS_AKS (secret) — AccessKey Secret; enables HMAC policy / PutObject
  * Optional:
- *   OSS_UPLOAD_HOST — PostObject host (CDN/custom). Empty → same as regional OSS_HOST.
- *   PUBLIC_STORAGE_HOST / PUBLIC_R2_HOST — only for GET / docs text.
+ *   SIGN_BACKEND — fallback only when OSS_AKS is unset
+ *   OSS_UPLOAD_HOST — upload host (CDN/custom). Empty → regional OSS_HOST
+ *   PUBLIC_STORAGE_HOST / PUBLIC_R2_HOST — GET / docs text only
  */
 function cfg(env) {
   const e = env || {};
   const BUCKET = String(e.OSS_BUCKET || "").trim();
   const ENDPOINT = String(e.OSS_ENDPOINT || "").trim();
   const AKID = String(e.OSS_AKID || "").trim();
+  const AKS = String(e.OSS_AKS || e.OSS_ACCESS_KEY_SECRET || "").trim();
   const BACKEND = String(e.SIGN_BACKEND || "").trim().replace(/\/$/, "");
   const PREFIX = String(e.OSS_PREFIX || "AttachFiles").trim() || "AttachFiles";
   const OSS_HOST = BUCKET && ENDPOINT ? `https://${BUCKET}.${ENDPOINT}` : "";
   const rawUpload = String(e.OSS_UPLOAD_HOST || e.OSS_UPLOAD_ENDPOINT || "").trim();
-  const UPLOAD_HOST = (rawUpload.replace(/\/$/, "") || OSS_HOST);
+  const UPLOAD_HOST = rawUpload.replace(/\/$/, "") || OSS_HOST;
+  // Prefer PutObject when we have SK (simpler stream, no multipart). Can force PostObject with OSS_PUT_MODE=post
+  const putMode = String(e.OSS_PUT_MODE || "auto").trim().toLowerCase();
   return {
     BUCKET,
     ENDPOINT,
     AKID,
+    AKS,
     BACKEND,
     PREFIX,
     OSS_HOST,
     UPLOAD_HOST,
+    PUT_MODE: putMode, // auto | put | post
     CHUNK_SIZE,
     PUBLIC_STORAGE_HOST: String(e.PUBLIC_STORAGE_HOST || "").trim().replace(/\/$/, ""),
     PUBLIC_R2_HOST: String(e.PUBLIC_R2_HOST || "").trim().replace(/\/$/, ""),
@@ -75,7 +83,9 @@ function cfg(env) {
 }
 
 function configOk(c) {
-  return !!(c.BUCKET && c.ENDPOINT && c.AKID && c.BACKEND && c.OSS_HOST);
+  if (!(c.BUCKET && c.ENDPOINT && c.AKID && c.OSS_HOST)) return false;
+  // Local SK preferred; remote SIGN_BACKEND still accepted as fallback.
+  return !!(c.AKS || c.BACKEND);
 }
 
 function getSafeId(path) {
@@ -94,7 +104,9 @@ export default {
 
     const c = cfg(env);
     if (!configOk(c)) {
-      console.error("missing bindings: need OSS_BUCKET, OSS_ENDPOINT, OSS_AKID, SIGN_BACKEND");
+      console.error(
+        "missing bindings: need OSS_BUCKET, OSS_ENDPOINT, OSS_AKID, and OSS_AKS (or SIGN_BACKEND)",
+      );
       return fail(500, "Storage worker misconfigured");
     }
 
@@ -662,23 +674,19 @@ async function persistSekaiMeta(c, meta) {
   try {
     const metaKey = `${c.PREFIX}/${SEKAI_USER}/${meta.uuid}.json`;
     const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
-    const sign2 = await fetchSign(c, SEKAI_USER);
-    if (!sign2) {
-      console.warn("v2 meta sign failed:", meta.uuid);
+    const mr = await uploadObject(c, {
+      userid: SEKAI_USER,
+      ossKey: metaKey,
+      contentType: "application/json",
+      displayName: `${meta.uuid}.json`,
+      cdValue: 'inline; filename="_meta.json"',
+      body: metaBytes,
+      bodySize: metaBytes.byteLength,
+    });
+    if (!mr) {
+      console.warn("v2 meta upload failed: no sign/response", meta.uuid);
       return;
     }
-    const [p2, s2] = sign2;
-    const mr = await postToOSS(
-      c,
-      metaKey,
-      p2,
-      s2,
-      "application/json",
-      `${meta.uuid}.json`,
-      'inline; filename="_meta.json"',
-      metaBytes,
-      metaBytes.byteLength,
-    );
     if (mr.status !== 200 && mr.status !== 201) {
       const errText = await mr.text().catch(() => "");
       console.warn("v2 meta upload failed:", mr.status, errText.slice(0, 200));
@@ -711,23 +719,26 @@ async function putSekaiV2(req, c, ctx) {
   const uuid = crypto.randomUUID();
   const ext = extOf(rawName);
   // OSS layout: AttachFiles/sekai/{uuid}{ext}
-  // Policy backend scopes keys to AttachFiles/{userid}/ — must sign as "sekai",
-  // not as uuid (that would only allow AttachFiles/{uuid}/… and AccessDenied).
+  // Policy/prefix user id = "sekai" (local policy allows AttachFiles/sekai/…)
   const SEKAI_USER = "sekai";
   const ossKey = `${c.PREFIX}/${SEKAI_USER}/${uuid}${ext}`;
   const display = sanitize(rawName);
   const cdValue = buildContentDisposition(display);
 
-  const sign = await fetchSign(c, SEKAI_USER);
-  if (!sign) return fail(502);
-  const [policy, sig] = sign;
-
-  const r = await postToOSS(c, ossKey, policy, sig, ct, display, cdValue, req.body, fileSize);
+  const r = await uploadObject(c, {
+    userid: SEKAI_USER,
+    ossKey,
+    contentType: ct,
+    displayName: display,
+    cdValue,
+    body: req.body,
+    bodySize: fileSize,
+  });
+  if (!r) return fail(502);
   if (r.status !== 200 && r.status !== 201) {
     const errText = await r.text().catch(() => "");
     console.error("OSS error (v2):", r.status, errText.slice(0, 800));
     await drain(r);
-    // Aliyun 520 = transient origin/edge failure (not our policy bug). Client should retry.
     if (r.status === 520 || r.status === 503) {
       return fail(502, `OSS temporary error (${r.status}); retry upload`);
     }
@@ -755,11 +766,9 @@ async function putSekaiV2(req, c, ctx) {
   if (w) meta.w = w;
   if (h) meta.h = h;
 
-  // Do not block the client on meta — resolve still works via extension probe.
   if (ctx && typeof ctx.waitUntil === "function") {
     ctx.waitUntil(persistSekaiMeta(c, meta));
   } else {
-    // Non-Workers / tests: still attempt, but don't fail the upload
     persistSekaiMeta(c, meta).catch(() => {});
   }
 
@@ -873,19 +882,25 @@ async function putSafe(req, c) {
   if (/\.\.|\/\/|[\x00-\x1f]/.test(rawName)) return fail(400);
   if (!rawName || rawName === "file") return fail(400);
 
-  const sign = await fetchSign(c, safeId);
-  if (!sign) return fail(502);
-  const [policy, sig] = sign;
-
   const cleanSP = safePath.replace(/\/+$/, "");
   const ossKey = `${c.PREFIX}/${cleanSP}/${rawName}`;
   const display = sanitize(rawName);
   const cdValue = buildContentDisposition(display);
 
-  const r = await postToOSS(c, ossKey, policy, sig, ct, display, cdValue, req.body, fileSize);
+  const r = await uploadObject(c, {
+    userid: safeId,
+    ossKey,
+    contentType: ct,
+    displayName: display,
+    cdValue,
+    body: req.body,
+    bodySize: fileSize,
+  });
+  if (!r) return fail(502);
   if (r.status !== 200 && r.status !== 201) {
     const errText = await r.text().catch(() => "");
     console.error("OSS error:", r.status, errText);
+    await drain(r);
     return fail(502);
   }
   await drain(r);
@@ -906,16 +921,21 @@ async function put(req, c) {
   const fileSize = parseInt(fSizeStr, 10);
 
   const uid = crypto.randomUUID();
-  const sign = await fetchSign(c, uid);
-  if (!sign) return fail(502);
-  const [policy, sig] = sign;
-
   const ext = extOf(rawName);
   const ossKey = `${c.PREFIX}/${uid}/${crypto.randomUUID()}${ext}`;
   const display = sanitize(rawName);
   const cdValue = buildContentDisposition(display);
 
-  const r = await postToOSS(c, ossKey, policy, sig, ct, display, cdValue, req.body, fileSize);
+  const r = await uploadObject(c, {
+    userid: uid,
+    ossKey,
+    contentType: ct,
+    displayName: display,
+    cdValue,
+    body: req.body,
+    bodySize: fileSize,
+  });
+  if (!r) return fail(502);
   if (r.status !== 200 && r.status !== 201) {
     await drain(r);
     return fail(502);
@@ -953,10 +973,6 @@ async function putChunk(req, c) {
   const safeId = safePath ? getSafeId(safePath) : null;
 
   const signUid = safeId || fileId;
-  const sign = await fetchSign(c, signUid);
-  if (!sign) return fail(502);
-  const [policy, sig] = sign;
-
   const basePath = safeId
     ? `${c.PREFIX}/${safePath.replace(/\/+$/, "")}`
     : `${c.PREFIX}/${fileId}`;
@@ -964,7 +980,16 @@ async function putChunk(req, c) {
   const display = sanitize(rawName);
   const cdValue = buildContentDisposition(display);
 
-  const r = await postToOSS(c, chunkKey, policy, sig, ct, display, cdValue, req.body, chunkSize);
+  const r = await uploadObject(c, {
+    userid: signUid,
+    ossKey: chunkKey,
+    contentType: ct,
+    displayName: display,
+    cdValue,
+    body: req.body,
+    bodySize: chunkSize,
+  });
+  if (!r) return fail(502);
   if (r.status !== 200 && r.status !== 201) {
     await drain(r);
     return fail(502);
@@ -984,24 +1009,17 @@ async function putChunk(req, c) {
     };
     const metaKey = `${basePath}/${fileId}/_meta`;
     const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
-
-    const sign2 = await fetchSign(c, signUid);
-    if (sign2) {
-      const [p2, s2] = sign2;
-      const mr = await postToOSS(
-        c,
-        metaKey,
-        p2,
-        s2,
-        "application/json",
-        "_meta",
-        'inline; filename="_meta"',
-        metaBytes,
-        metaBytes.byteLength,
-      );
-      if (mr.status === 200 || mr.status === 201) metaUploaded = true;
-      await drain(mr);
-    }
+    const mr = await uploadObject(c, {
+      userid: signUid,
+      ossKey: metaKey,
+      contentType: "application/json",
+      displayName: "_meta",
+      cdValue: 'inline; filename="_meta"',
+      body: metaBytes,
+      bodySize: metaBytes.byteLength,
+    });
+    if (mr && (mr.status === 200 || mr.status === 201)) metaUploaded = true;
+    if (mr) await drain(mr);
   }
 
   const relKey = `${basePath.slice(c.PREFIX.length + 1)}/${fileId}`;
@@ -1017,17 +1035,140 @@ async function putChunk(req, c) {
 }
 
 /* ═══════════════════════════════════════════════════════
- *  PostObject → OSS (streaming — do NOT buffer whole file;
- *  Worker CPU budget is tiny; full-body copy blows the limit)
- *
- *  Upload host defaults to CDN custom domain (UPLOAD_HOST); GET
- *  still uses regional OSS_HOST. Buffered bodies can fall back to
- *  regional if the primary host rejects the PostObject.
+ *  Upload (PostObject policy / PutObject V1)
  * ═══════════════════════════════════════════════════════ */
 
-function isBufferedBody(body) {
-  return body instanceof Uint8Array || body instanceof ArrayBuffer;
+function bufToBase64(buf) {
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let s = "";
+  // chunked to avoid call-stack / argument limits
+  const chunk = 0x8000;
+  for (let i = 0; i < u8.length; i += chunk) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+  }
+  return btoa(s);
 }
+
+async function hmacSha1Base64(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return bufToBase64(sig);
+}
+
+/** Local PostObject policy — same shape as legacy webservice. */
+async function signPolicyLocal(c, userid) {
+  const exp = new Date(Date.now() + 30 * 60 * 1000);
+  // Aliyun accepts ISO-8601 with millis
+  const expiration = exp.toISOString();
+  const policyObj = {
+    expiration,
+    conditions: [
+      ["content-length-range", 0, 1048576000],
+      ["starts-with", "$key", `${c.PREFIX}/${userid}/`],
+    ],
+  };
+  // Policy document must be base64 of UTF-8 JSON (compact is fine)
+  const policy = bufToBase64(new TextEncoder().encode(JSON.stringify(policyObj)));
+  const signature = await hmacSha1Base64(c.AKS, policy);
+  return [policy, signature];
+}
+
+async function fetchSignRemote(c, userid) {
+  try {
+    const r = await fetch(
+      `${c.BACKEND}/File/GetOssPolicy2Signature?` +
+        new URLSearchParams({ userid, bucket: c.BUCKET }),
+    );
+    return r.ok ? await r.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns [policy, signature] for PostObject.
+ * Prefer local HMAC when OSS_AKS is set (no remote signing RTT).
+ */
+async function fetchSign(c, userid) {
+  if (c.AKS) {
+    try {
+      return await signPolicyLocal(c, userid);
+    } catch (e) {
+      console.error("local policy sign failed:", e);
+      // fall through to remote if configured
+    }
+  }
+  if (c.BACKEND) return fetchSignRemote(c, userid);
+  return null;
+}
+
+function bodyToStream(body) {
+  if (!body) {
+    return new ReadableStream({
+      start(c) {
+        c.close();
+      },
+    });
+  }
+  if (typeof body.getReader === "function" && !(body instanceof Uint8Array)) {
+    return body;
+  }
+  if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
+    const u8 = body instanceof ArrayBuffer ? new Uint8Array(body) : body;
+    return new ReadableStream({
+      start(controller) {
+        controller.enqueue(u8);
+        controller.close();
+      },
+    });
+  }
+  if (typeof body[Symbol.asyncIterator] === "function") {
+    return ReadableStream.from(body);
+  }
+  return null;
+}
+
+/**
+ * PutObject with OSS V1 signature (needs OSS_AKS).
+ * Streams the request body as-is — no multipart wrapper.
+ * Signs CanonicalizedResource as /{bucket}/{key} (required for custom domains too).
+ */
+async function putObjectOSS(c, ossKey, contentType, body, bodySize) {
+  const date = new Date().toUTCString();
+  const ct = contentType || "application/octet-stream";
+  const resource = `/${c.BUCKET}/${ossKey}`;
+  const stringToSign = `PUT\n\n${ct}\n${date}\n${resource}`;
+  const signature = await hmacSha1Base64(c.AKS, stringToSign);
+  const stream = bodyToStream(body);
+  if (!stream) throw new Error("unsupported body type for PutObject");
+
+  const path = ossKey
+    .split("/")
+    .map((s) => encodeURIComponent(s))
+    .join("/");
+  // Prefer CDN/custom upload host; fall back to regional virtual-host URL built by caller retry.
+  const base = (c.UPLOAD_HOST || c.OSS_HOST).replace(/\/$/, "");
+  return fetch(`${base}/${path}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": ct,
+      "Content-Length": String(bodySize),
+      Date: date,
+      Authorization: `OSS ${c.AKID}:${signature}`,
+    },
+    body: stream,
+  });
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  PostObject → OSS (streaming — do NOT buffer whole file)
+ * ═══════════════════════════════════════════════════════ */
 
 function toUint8(body) {
   if (body instanceof Uint8Array) return body;
@@ -1062,22 +1203,7 @@ async function postToOSSOnce(uploadHost, c, ossKey, policy, sig, contentType, di
   const tailData = enc.encode(tail);
   const totalLen = headData.byteLength + bodySize + tailData.byteLength;
 
-  // Prefer native ReadableStream pipe when body is already a stream (lowest CPU).
-  let fileStream = null;
-  if (body && typeof body.getReader === "function" && !(body instanceof Uint8Array)) {
-    fileStream = body;
-  } else if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
-    const u8 = body instanceof ArrayBuffer ? new Uint8Array(body) : body;
-    fileStream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(u8);
-        controller.close();
-      },
-    });
-  } else if (body && typeof body[Symbol.asyncIterator] === "function") {
-    fileStream = ReadableStream.from(body);
-  }
-
+  const fileStream = bodyToStream(body);
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
 
@@ -1103,7 +1229,6 @@ async function postToOSSOnce(uploadHost, c, ossKey, policy, sig, contentType, di
       }
     }
   };
-  // Duplex: start pump, do not await before fetch.
   pump();
 
   return fetch(uploadHost, {
@@ -1136,7 +1261,6 @@ async function postToOSS(c, ossKey, policy, sig, contentType, displayName, cdVal
     return r;
   }
 
-  // Streamed request bodies cannot be replayed. Only retry buffered meta/small payloads.
   const buffered = toUint8(body);
   if (!buffered) {
     console.warn("postToOSS primary failed (no retry for stream):", primary, r.status);
@@ -1158,6 +1282,75 @@ async function postToOSS(c, ossKey, policy, sig, contentType, displayName, cdVal
     cdValue,
     buffered,
     buffered.byteLength,
+  );
+}
+
+/**
+ * Unified upload entry used by all PUT handlers.
+ *
+ * With OSS_AKS:
+ *  - PUT_MODE=put  → PutObject only
+ *  - PUT_MODE=post → PostObject with local HMAC policy (no external signer)
+ *  - PUT_MODE=auto → PutObject when upload host is regional OSS; else PostObject
+ *    (CDN custom domains often accept PostObject but not V1 PutObject)
+ * Without OSS_AKS: PostObject via SIGN_BACKEND (legacy).
+ */
+async function uploadObject(c, opts) {
+  const { userid, ossKey, contentType, displayName, cdValue, body, bodySize } = opts;
+
+  const uploadIsRegional =
+    !c.UPLOAD_HOST || c.UPLOAD_HOST === c.OSS_HOST || c.UPLOAD_HOST.includes(".aliyuncs.com");
+  const preferPut =
+    c.AKS &&
+    (c.PUT_MODE === "put" || (c.PUT_MODE === "auto" && uploadIsRegional));
+
+  const buffered = toUint8(body);
+
+  if (preferPut) {
+    try {
+      const r = await putObjectOSS(c, ossKey, contentType, body, bodySize);
+      if (r.status === 200 || r.status === 201) return r;
+
+      const errText = await r.text().catch(() => "");
+      console.warn("PutObject failed:", r.status, errText.slice(0, 240));
+      await drain(r);
+
+      if (!buffered) return new Response(errText, { status: r.status });
+      if (c.PUT_MODE === "put") return new Response(errText, { status: r.status });
+
+      const sign = await fetchSign(c, userid);
+      if (!sign) return new Response(errText, { status: r.status });
+      const [policy, sig] = sign;
+      return postToOSS(
+        c,
+        ossKey,
+        policy,
+        sig,
+        contentType,
+        displayName,
+        cdValue,
+        buffered,
+        buffered.byteLength,
+      );
+    } catch (e) {
+      console.warn("PutObject error:", e && e.message ? e.message : e);
+      if (!buffered) throw e;
+    }
+  }
+
+  const sign = await fetchSign(c, userid);
+  if (!sign) return null;
+  const [policy, sig] = sign;
+  return postToOSS(
+    c,
+    ossKey,
+    policy,
+    sig,
+    contentType,
+    displayName,
+    cdValue,
+    buffered || body,
+    bodySize,
   );
 }
 
@@ -1430,21 +1623,6 @@ async function delChunked(_req, ctx, url, c, innerPath) {
     total: keys.length,
     safe: !!safeId,
   });
-}
-
-/* ═══════════════════════════════════════════════════════
- *  签名
- * ═══════════════════════════════════════════════════════ */
-async function fetchSign(c, userid) {
-  try {
-    const r = await fetch(
-      `${c.BACKEND}/File/GetOssPolicy2Signature?` +
-        new URLSearchParams({ userid, bucket: c.BUCKET }),
-    );
-    return r.ok ? await r.json() : null;
-  } catch {
-    return null;
-  }
 }
 
 /* ═══════════════════════════════════════════════════════

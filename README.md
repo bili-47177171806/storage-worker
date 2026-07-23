@@ -20,8 +20,9 @@ No bucket names, private endpoints, or AccessKey material are hardcoded in `work
 cp wrangler.toml.example wrangler.toml.local
 # edit wrangler.toml.local — your bucket, endpoint, signing backend, optional CDN host
 
-# 2. AccessKey Id only (never the Secret)
+# 2. AccessKey Id + Secret (Cloudflare secrets — never commit)
 npx wrangler secret put OSS_AKID -c wrangler.toml.local
+npx wrangler secret put OSS_AKS  -c wrangler.toml.local
 
 # 3. Deploy
 npx wrangler deploy -c wrangler.toml.local
@@ -34,23 +35,26 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 | Binding | Required | Location | Description |
 |---------|----------|----------|-------------|
 | `OSS_BUCKET` | yes | `[vars]` | Bucket name |
-| `OSS_ENDPOINT` | yes | `[vars]` | Regional endpoint host, e.g. `oss-cn-hangzhou.aliyuncs.com` |
-| `OSS_AKID` | yes | **secret** | AccessKey **Id** only |
-| `SIGN_BACKEND` | yes | `[vars]` | Origin of policy signing API |
-| `OSS_PREFIX` | no | `[vars]` | Object key prefix (default `AttachFiles` if empty) |
-| `OSS_UPLOAD_HOST` | no | `[vars]` | PostObject URL origin; empty → `https://$BUCKET.$ENDPOINT` |
+| `OSS_ENDPOINT` | yes | `[vars]` | Regional endpoint host |
+| `OSS_AKID` | yes | **secret** | AccessKey **Id** |
+| `OSS_AKS` | recommended | **secret** | AccessKey **Secret** (local HMAC / PutObject) |
+| `OSS_PREFIX` | no | `[vars]` | Object key prefix (default `AttachFiles`) |
+| `OSS_UPLOAD_HOST` | no | `[vars]` | Upload origin; empty → regional host |
+| `OSS_PUT_MODE` | no | `[vars]` | `auto` (default) / `put` / `post` |
+| `SIGN_BACKEND` | no* | `[vars]` | Remote policy API if `OSS_AKS` unset |
 | `PUBLIC_STORAGE_HOST` | no | `[vars]` | Docs only |
 | `PUBLIC_R2_HOST` | no | `[vars]` | Docs only |
 
-Signing contract expected by the Worker:
+\* Required only when `OSS_AKS` is not set.
+
+**Preferred:** set `OSS_AKS` so the Worker signs PostObject policy (or PutObject) locally — no external signer RTT.
+
+**Legacy fallback:** without SK,
 
 ```http
 GET {SIGN_BACKEND}/File/GetOssPolicy2Signature?userid={id}&bucket={bucket}
+→ ["<base64-policy>","<signature>"]
 ```
-
-JSON body: `["<base64-policy>","<signature>"]`.  
-Policy must allow keys under your prefix (e.g. `AttachFiles/{userid}/…`).  
-The AccessKey **Secret** stays on that backend.
 
 ## API (summary)
 
