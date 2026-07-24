@@ -20,6 +20,26 @@ const SAFE_USERIDS = new Set(["public", "shared", "open"]);
 
 /** Non-secret runtime knobs that are not environment-specific. */
 const CHUNK_SIZE = 10 * 1024 * 1024;
+/** Soft cap aligned with local PostObject content-length-range. */
+const MAX_UPLOAD_BYTES = 1048576000;
+/** Extensions probed when v2 meta sidecar is missing (common first). */
+const SEKAI_PROBE_EXTS = [
+  "",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".bin",
+  ".mp3",
+  ".flac",
+  ".ogg",
+  ".wav",
+  ".pdf",
+  ".zip",
+  ".mp4",
+  ".webm",
+];
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -706,12 +726,15 @@ async function putSekaiV2(req, c, ctx) {
   if (!c.AKID) return fail(500, "OSS_AKID not configured");
 
   const encodedName = (req.headers.get("X-Filename") || "file").trim();
-  const rawName = decodeURIComponent(encodedName);
+  const rawName = safeDecodeFilename(encodedName);
+  if (!rawName) return fail(400, "Invalid X-Filename");
   const ct = req.headers.get("Content-Type") || "application/octet-stream";
   const fSizeStr = req.headers.get("Content-Length");
   if (!fSizeStr) return fail(400);
   const fileSize = parseInt(fSizeStr, 10);
-  if (!Number.isFinite(fileSize) || fileSize < 0) return fail(400);
+  if (!Number.isFinite(fileSize) || fileSize < 0 || fileSize > MAX_UPLOAD_BYTES) {
+    return fail(400, "Invalid Content-Length");
+  }
 
   if (/\.\.|\/\/|[\x00-\x1f]/.test(rawName)) return fail(400);
 
@@ -811,18 +834,27 @@ async function resolveSekaiOssKey(c, uuid) {
   const meta = await loadSekaiMeta(c, uuid);
   if (meta && meta.ossKey) return { ossKey: meta.ossKey, meta };
 
-  // Fallback: probe common extensions when meta missing
-  const candidates = ["", ".bin", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp3", ".flac", ".ogg", ".wav", ".pdf", ".zip", ".mp4", ".webm"];
-  for (const ext of candidates) {
-    const ossKey = `${c.PREFIX}/sekai/${uuid}${ext}`;
-    const head = await fetch(`${c.OSS_HOST}/${ossKey}`, { method: "HEAD" });
-    if (head.ok) {
-      await drain(head);
-      return { ossKey, meta: meta || { uuid, type: head.headers.get("Content-Type") || "application/octet-stream" } };
-    }
-    await drain(head);
-  }
-  return null;
+  // Fallback: probe common extensions in parallel when meta is missing
+  const probes = await Promise.all(
+    SEKAI_PROBE_EXTS.map(async (ext) => {
+      const ossKey = `${c.PREFIX}/sekai/${uuid}${ext}`;
+      try {
+        const head = await fetch(`${c.OSS_HOST}/${ossKey}`, { method: "HEAD" });
+        const ok = head.ok;
+        const type = head.headers.get("Content-Type") || "application/octet-stream";
+        await drain(head);
+        return ok ? { ossKey, type } : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const hit = probes.find(Boolean);
+  if (!hit) return null;
+  return {
+    ossKey: hit.ossKey,
+    meta: meta || { uuid, type: hit.type },
+  };
 }
 
 async function getSekaiObject(req, ctx, url, c, kind, uuid) {
@@ -856,11 +888,15 @@ async function getSekaiMeta(req, c, uuid) {
 async function putSafe(req, c) {
   const safePath = (req.headers.get("X-Safe-Path") || "").trim();
   const encodedName = (req.headers.get("X-Filename") || "file").trim();
-  const rawName = decodeURIComponent(encodedName);
+  const rawName = safeDecodeFilename(encodedName);
+  if (!rawName) return fail(400, "Invalid X-Filename");
   const ct = req.headers.get("Content-Type") || "application/octet-stream";
   const fSizeStr = req.headers.get("Content-Length");
   if (!fSizeStr) return fail(400);
   const fileSize = parseInt(fSizeStr, 10);
+  if (!Number.isFinite(fileSize) || fileSize < 0 || fileSize > MAX_UPLOAD_BYTES) {
+    return fail(400, "Invalid Content-Length");
+  }
 
   const safeId = getSafeId(safePath);
   if (!safeId) {
@@ -914,11 +950,15 @@ async function putSafe(req, c) {
  * ═══════════════════════════════════════════════════════ */
 async function put(req, c) {
   const encodedName = (req.headers.get("X-Filename") || "file").trim();
-  const rawName = decodeURIComponent(encodedName);
+  const rawName = safeDecodeFilename(encodedName);
+  if (!rawName) return fail(400, "Invalid X-Filename");
   const ct = req.headers.get("Content-Type") || "application/octet-stream";
   const fSizeStr = req.headers.get("Content-Length");
   if (!fSizeStr) return fail(400);
   const fileSize = parseInt(fSizeStr, 10);
+  if (!Number.isFinite(fileSize) || fileSize < 0 || fileSize > MAX_UPLOAD_BYTES) {
+    return fail(400, "Invalid Content-Length");
+  }
 
   const uid = crypto.randomUUID();
   const ext = extOf(rawName);
@@ -967,8 +1007,14 @@ async function putChunk(req, c) {
 
   if (isNaN(index) || isNaN(total) || isNaN(chunkSize) || isNaN(fileSize)) return fail(400);
   if (index < 0 || index >= total || total < 1 || total > 10000) return fail(400);
+  if (chunkSize < 0 || chunkSize > MAX_UPLOAD_BYTES || fileSize < 0 || fileSize > MAX_UPLOAD_BYTES) {
+    return fail(400, "Invalid size");
+  }
+  // Basic fileId hygiene — used in OSS keys
+  if (!/^[A-Za-z0-9._-]{1,128}$/.test(fileId)) return fail(400, "Invalid X-File-ID");
 
-  const rawName = decodeURIComponent(encodedName);
+  const rawName = safeDecodeFilename(encodedName);
+  if (!rawName) return fail(400, "Invalid X-Original-Filename");
   const safePath = (req.headers.get("X-Safe-Path") || "").trim();
   const safeId = safePath ? getSafeId(safePath) : null;
 
@@ -1536,6 +1582,7 @@ function fetchChunk(c, innerPath, index) {
  *  DELETE
  * ═══════════════════════════════════════════════════════ */
 async function delSafe(_req, ctx, url, c, path) {
+  if (!c.BACKEND) return fail(500, "SIGN_BACKEND required for delete");
   const safeId = getSafeId(path);
   const ossKey = `${c.PREFIX}/${path}`;
 
@@ -1556,6 +1603,7 @@ async function delSafe(_req, ctx, url, c, path) {
 }
 
 async function del(_req, ctx, url, c, path, ossKey) {
+  if (!c.BACKEND) return fail(500, "SIGN_BACKEND required for delete");
   const uid = firstSeg(path);
   const r = await fetch(`${c.BACKEND}/File/DeleteOssObject`, {
     method: "POST",
@@ -1573,6 +1621,7 @@ async function del(_req, ctx, url, c, path, ossKey) {
 }
 
 async function delChunked(_req, ctx, url, c, innerPath) {
+  if (!c.BACKEND) return fail(500, "SIGN_BACKEND required for delete");
   const safeId = getSafeId(innerPath);
   const uid = safeId || firstSeg(innerPath);
   const metaKey = `${c.PREFIX}/${innerPath}/_meta`;
@@ -1591,25 +1640,26 @@ async function delChunked(_req, ctx, url, c, innerPath) {
   for (let i = 0; i < meta.chunks; i++) keys.push(`${c.PREFIX}/${innerPath}/${i}`);
   keys.push(metaKey);
 
-  const results = [];
-  for (const key of keys) {
-    try {
-      const r = await fetch(`${c.BACKEND}/File/DeleteOssObject`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ userid: uid, key, bucket: c.BUCKET }),
-      });
-      let s = false;
+  if (!c.BACKEND) return fail(500, "SIGN_BACKEND required for delete");
+
+  const results = await Promise.all(
+    keys.map(async (key) => {
       try {
-        s = (await r.json()) == 1;
+        const r = await fetch(`${c.BACKEND}/File/DeleteOssObject`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ userid: uid, key, bucket: c.BUCKET }),
+        });
+        try {
+          return (await r.json()) == 1;
+        } catch {
+          return false;
+        }
       } catch {
-        /* ignore */
+        return false;
       }
-      results.push(s);
-    } catch {
-      results.push(false);
-    }
-  }
+    }),
+  );
 
   const allOk = results.every(Boolean);
   if (allOk) ctx.waitUntil(caches.default.delete(`${url.origin}/chunked/${innerPath}`));
@@ -1624,6 +1674,19 @@ async function delChunked(_req, ctx, url, c, innerPath) {
 /* ═══════════════════════════════════════════════════════
  *  工具
  * ═══════════════════════════════════════════════════════ */
+
+/** Decode percent-encoded filenames without throwing on malformed sequences. */
+function safeDecodeFilename(encoded) {
+  try {
+    const name = decodeURIComponent(String(encoded || "").trim() || "file");
+    // Cap absurd names (path-like junk still filtered by callers)
+    if (name.length > 512) return null;
+    return name;
+  } catch {
+    return null;
+  }
+}
+
 function extOf(n) {
   const i = n.lastIndexOf(".");
   return i >= 0 ? n.slice(i).toLowerCase() : "";
@@ -1712,6 +1775,7 @@ function ok(data) {
     headers: {
       "Content-Type": "application/json;charset=utf-8",
       "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }
@@ -1733,6 +1797,7 @@ function fail(status, detail) {
     headers: {
       "Content-Type": "application/json;charset=utf-8",
       "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }
