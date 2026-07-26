@@ -16,3 +16,5 @@ jobs:
           node-version: '24'
       - name: Syntax check worker.js
         run: node --check worker.js
+      - name: Test
+        run: node --test "test/*.test.mjs"
