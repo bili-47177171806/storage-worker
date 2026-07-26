@@ -1694,7 +1694,13 @@ function extOf(n) {
 function sanitize(n) {
   // Keep word chars, dots, dashes, and non-ASCII (CJK etc.); collapse runs of _
   const cleaned = String(n || "")
-    .replace(/[^\w.\- -￿]/g, "_")
+    // 保留：词字符、点、连字符，以及**全部非 ASCII**（\u00a0 起，含 CJK）。
+    // 反过来说，ASCII 里除词字符与 . - 之外的一切 —— 空格、引号、反斜杠、
+    // 分号、斜杠、控制字符 —— 都会变成下划线。
+    //
+    // \u00a0 必须写成转义。写成字面量时它在编辑器里就是一个空格，
+    // 读的人（包括我）会以为范围是 \u0020-\uffff，从而误判引号能通过。
+    .replace(/[^\w.\-\u00a0-\uffff]/g, "_")
     .replace(/_{2,}/g, "_");
   return cleaned || "file";
 }
