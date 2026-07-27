@@ -99,7 +99,34 @@ function cfg(env) {
     CHUNK_SIZE,
     PUBLIC_STORAGE_HOST: String(e.PUBLIC_STORAGE_HOST || "").trim().replace(/\/$/, ""),
     PUBLIC_R2_HOST: String(e.PUBLIC_R2_HOST || "").trim().replace(/\/$/, ""),
+    DELETE_ENABLED: String(e.DELETE_ENABLED || "").trim() === "1",
   };
+}
+
+/**
+ * 删除是否开放。
+ *
+ * ── 为什么需要这个开关 ────────────────────────────────────────────
+ *
+ * 本 Worker **没有任何鉴权**（见 issue #3）。删除端点今天之所以打不通，
+ * 是因为三个 delete 函数都要求 `SIGN_BACKEND`，而当前部署优先本地签名
+ * （`OSS_AKS`），`SIGN_BACKEND` 多半没配 —— 于是全部返回 500。
+ *
+ * **那是意外，不是设计。** 一旦有人为了别的目的配上 `SIGN_BACKEND`，
+ * 删除立刻变成无鉴权的：任何人可以删任何对象，没有任何提示。
+ *
+ * 这里把「意外的缓解」变成「有意的拒绝」：删除需要显式设 `DELETE_ENABLED=1`，
+ * 与 `SIGN_BACKEND` 解耦。默认拒绝，且给的是 403 加一句说明，
+ * 而不是一个让人以为服务坏了的 500。
+ *
+ * **打开它之前请先解决鉴权** —— 这个开关只是让那个决定变成显式的，
+ * 它本身不提供任何身份校验。
+ *
+ * 当前没有任何客户端依赖删除：nightcord 的 `file-upload-service.js`
+ * 里有个 `delete()` 方法，但全仓没有调用点，而且它现在必然拿到 500。
+ */
+function deleteAllowed(c) {
+  return c.DELETE_ENABLED;
 }
 
 function configOk(c) {
@@ -1582,6 +1609,9 @@ function fetchChunk(c, innerPath, index) {
  *  DELETE
  * ═══════════════════════════════════════════════════════ */
 async function delSafe(_req, ctx, url, c, path) {
+  if (!deleteAllowed(c)) {
+    return fail(403, "delete is disabled — set DELETE_ENABLED=1 to enable. NOTE: this endpoint has no authentication (issue #3); solve that first.");
+  }
   if (!c.BACKEND) return fail(500, "SIGN_BACKEND required for delete");
   const safeId = getSafeId(path);
   const ossKey = `${c.PREFIX}/${path}`;
@@ -1603,6 +1633,9 @@ async function delSafe(_req, ctx, url, c, path) {
 }
 
 async function del(_req, ctx, url, c, path, ossKey) {
+  if (!deleteAllowed(c)) {
+    return fail(403, "delete is disabled — set DELETE_ENABLED=1 to enable. NOTE: this endpoint has no authentication (issue #3); solve that first.");
+  }
   if (!c.BACKEND) return fail(500, "SIGN_BACKEND required for delete");
   const uid = firstSeg(path);
   const r = await fetch(`${c.BACKEND}/File/DeleteOssObject`, {
@@ -1621,6 +1654,9 @@ async function del(_req, ctx, url, c, path, ossKey) {
 }
 
 async function delChunked(_req, ctx, url, c, innerPath) {
+  if (!deleteAllowed(c)) {
+    return fail(403, "delete is disabled — set DELETE_ENABLED=1 to enable. NOTE: this endpoint has no authentication (issue #3); solve that first.");
+  }
   if (!c.BACKEND) return fail(500, "SIGN_BACKEND required for delete");
   const safeId = getSafeId(innerPath);
   const uid = safeId || firstSeg(innerPath);
@@ -1640,6 +1676,9 @@ async function delChunked(_req, ctx, url, c, innerPath) {
   for (let i = 0; i < meta.chunks; i++) keys.push(`${c.PREFIX}/${innerPath}/${i}`);
   keys.push(metaKey);
 
+  if (!deleteAllowed(c)) {
+    return fail(403, "delete is disabled — set DELETE_ENABLED=1 to enable. NOTE: this endpoint has no authentication (issue #3); solve that first.");
+  }
   if (!c.BACKEND) return fail(500, "SIGN_BACKEND required for delete");
 
   const results = await Promise.all(
@@ -1694,7 +1733,13 @@ function extOf(n) {
 function sanitize(n) {
   // Keep word chars, dots, dashes, and non-ASCII (CJK etc.); collapse runs of _
   const cleaned = String(n || "")
-    .replace(/[^\w.\- -￿]/g, "_")
+    // 保留：词字符、点、连字符，以及**全部非 ASCII**（\u00a0 起，含 CJK）。
+    // 反过来说，ASCII 里除词字符与 . - 之外的一切 —— 空格、引号、反斜杠、
+    // 分号、斜杠、控制字符 —— 都会变成下划线。
+    //
+    // \u00a0 必须写成转义。写成字面量时它在编辑器里就是一个空格，
+    // 读的人（包括我）会以为范围是 \u0020-\uffff，从而误判引号能通过。
+    .replace(/[^\w.\-\u00a0-\uffff]/g, "_")
     .replace(/_{2,}/g, "_");
   return cleaned || "file";
 }
