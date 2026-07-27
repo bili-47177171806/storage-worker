@@ -1801,3 +1801,26 @@ function fail(status, detail) {
     },
   });
 }
+
+/* ═══════════════════════════════════════════════════════
+ *  Named exports (tests only)
+ *
+ *  wrangler 只使用上面的 default export，这些具名导出不影响运行时行为，
+ *  只是让 test/ 能直接测这些纯函数 —— 本仓 1600+ 行此前零测试。
+ * ═══════════════════════════════════════════════════════ */
+export {
+  CORS_HEADERS,
+  SAFE_USERIDS,
+  MAX_UPLOAD_BYTES,
+  UUID_RE,
+  cfg,
+  configOk,
+  getSafeId,
+  negotiateDocsFormat,
+  estimateMarkdownTokens,
+  inferKind,
+  safeDecodeFilename,
+  extOf,
+  sanitize,
+  encRFC5987,
+};
