@@ -1429,21 +1429,8 @@ async function uploadObject(c, opts) {
 async function get(req, ctx, url, c, ossKey) {
   const method = req.method;
   const isRange = req.headers.has("Range");
-  const cache = caches.default;
-  const ck = `${url.origin}${url.pathname}`;
   const path = url.pathname.slice(1);
   const safe = !!getSafeId(path);
-
-  if (!isRange && !safe) {
-    const hit = await cache.match(ck);
-    if (hit) {
-      if (!isStale(req, hit)) return notModified(hit);
-      if (method === "HEAD") {
-        return new Response(null, { status: hit.status, headers: hit.headers });
-      }
-      return hit;
-    }
-  }
 
   const fwd = pick(req.headers, ["Range", "If-None-Match", "If-Modified-Since"]);
   const r = await fetch(`${c.OSS_HOST}/${ossKey}`, {
@@ -1469,9 +1456,6 @@ async function get(req, ctx, url, c, ossKey) {
   }
 
   const resp = new Response(method === "HEAD" ? null : r.body, { status: r.status, headers: h });
-  if (r.status === 200 && method === "GET" && !isRange && !safe) {
-    ctx.waitUntil(cache.put(ck, resp.clone()));
-  }
   return resp;
 }
 
@@ -1507,6 +1491,7 @@ async function getChunked(req, ctx, url, c, innerPath) {
   h.set("Access-Control-Allow-Origin", "*");
   h.set("Access-Control-Expose-Headers", PASS_HEADERS.join(", "));
   h.set("Accept-Ranges", "bytes");
+  h.set("Cache-Control", "public, max-age=31536000, immutable");
 
   if (isRange) {
     const parsed = parseRange(req.headers.get("Range"), totalSize);
@@ -1628,7 +1613,7 @@ async function delSafe(_req, ctx, url, c, path) {
     /* ignore */
   }
 
-  if (success) ctx.waitUntil(caches.default.delete(`${url.origin}/${path}`));
+  if (success) ctx.waitUntil(ctx.cache.purge({ pathPrefixes: [`/${path}`] }));
   return ok({ ok: success, safe: true });
 }
 
@@ -1649,7 +1634,7 @@ async function del(_req, ctx, url, c, path, ossKey) {
   } catch {
     /* ignore */
   }
-  if (success) ctx.waitUntil(caches.default.delete(`${url.origin}/${path}`));
+  if (success) ctx.waitUntil(ctx.cache.purge({ pathPrefixes: [`/${path}`] }));
   return ok({ ok: success });
 }
 
@@ -1701,7 +1686,7 @@ async function delChunked(_req, ctx, url, c, innerPath) {
   );
 
   const allOk = results.every(Boolean);
-  if (allOk) ctx.waitUntil(caches.default.delete(`${url.origin}/chunked/${innerPath}`));
+  if (allOk) ctx.waitUntil(ctx.cache.purge({ pathPrefixes: [`/chunked/${innerPath}`] }));
   return ok({
     ok: allOk,
     deleted: results.filter(Boolean).length,
@@ -1773,27 +1758,6 @@ function parseRange(header, total) {
   }
   if (isNaN(s) || isNaN(e) || s < 0 || e >= total || s > e) return null;
   return [s, e];
-}
-
-function isStale(req, cached) {
-  const inm = req.headers.get("If-None-Match");
-  const etag = cached.headers.get("ETag");
-  if (!inm || !etag) return true;
-  if (inm.trim() === "*") return false;
-  const t = bare(etag);
-  return !inm.split(",").some((v) => bare(v.trim()) === t);
-}
-function bare(e) {
-  return e.replace(/^W\//, "").replace(/"/g, "");
-}
-function notModified(cached) {
-  const h = new Headers();
-  for (const k of ["ETag", "Last-Modified", "Cache-Control"]) {
-    const v = cached.headers.get(k);
-    if (v) h.set(k, v);
-  }
-  h.set("Access-Control-Allow-Origin", "*");
-  return new Response(null, { status: 304, headers: h });
 }
 
 function firstSeg(p) {
