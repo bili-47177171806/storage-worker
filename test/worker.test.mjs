@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import worker, {
   CORS_HEADERS,
   SAFE_USERIDS,
+  ANON_MAX_UPLOAD_BYTES,
   MAX_UPLOAD_BYTES,
   UUID_RE,
   cfg,
@@ -297,15 +298,30 @@ describe('cfg / configOk', () => {
 });
 
 describe('常量', () => {
-  test('MAX_UPLOAD_BYTES 与文档中的约 1GB 一致', () => {
+  test('MAX_UPLOAD_BYTES 是鉴权后的绝对硬顶（约 1GB，不变）', () => {
     assert.equal(MAX_UPLOAD_BYTES, 1048576000);
   });
 
-  test('CORS 允许上传所需的自定义头', () => {
+  test('ANON_MAX_UPLOAD_BYTES 对齐 Cloudflare 512 MiB 缓存上限', () => {
+    assert.equal(ANON_MAX_UPLOAD_BYTES, 512 * 1024 * 1024);
+    assert.equal(ANON_MAX_UPLOAD_BYTES, 536870912);
+  });
+
+  test('匿名档严格小于绝对硬顶 —— 否则「需 token」的档位不存在', () => {
+    assert.ok(ANON_MAX_UPLOAD_BYTES < MAX_UPLOAD_BYTES);
+  });
+
+  test('CORS 允许上传所需的自定义头（含 Authorization）', () => {
     const allowed = CORS_HEADERS['Access-Control-Allow-Headers'];
-    for (const h of ['X-Filename', 'X-Chunk-Index', 'X-Chunk-Total', 'X-Sekai-Kind']) {
+    for (const h of ['Authorization', 'X-Filename', 'X-Chunk-Index', 'X-Chunk-Total', 'X-Sekai-Kind']) {
       assert.ok(allowed.includes(h), h);
     }
+  });
+
+  test('CORS 暴露 WWW-Authenticate 给浏览器脚本', () => {
+    assert.ok(
+      (CORS_HEADERS['Access-Control-Expose-Headers'] || '').includes('WWW-Authenticate'),
+    );
   });
 });
 

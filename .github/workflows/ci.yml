@@ -14,7 +14,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      # worker.js 现在 import @25-ji-code-de/sekai-worker-kit（> 512 MiB 上传鉴权），
+      # 测试会加载 worker.js，必须先装依赖。lockfile 被 gitignore，故 ci 回退到 install。
+      - name: Install
+        run: npm ci || npm install
       - name: Syntax check worker.js
         run: node --check worker.js
       - name: Test
-        run: node --test "test/*.test.mjs"
+        run: npm test

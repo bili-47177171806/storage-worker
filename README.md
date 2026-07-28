@@ -44,8 +44,11 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 | `SIGN_BACKEND` | no* | `[vars]` | Remote policy API if `OSS_AKS` unset |
 | `PUBLIC_STORAGE_HOST` | no | `[vars]` | Docs only |
 | `PUBLIC_R2_HOST` | no | `[vars]` | Docs only |
+| `ABUSE_REPORT_EMAIL` | no | `[vars]` | Abuse contact shown in API docs / README |
+| `AUTH_DB` | no** | `[[d1_databases]]` | SEKAI Pass D1 (`sekai_pass_db`); needed only for uploads > 512 MiB |
 
 \* Required only when `OSS_AKS` is not set.
+\*\* Required only if you allow uploads above the 512 MiB anonymous cap. Anonymous uploads never touch it.
 
 **Preferred:** set `OSS_AKS` so the Worker signs PostObject policy (or PutObject) locally — no external signer RTT.
 
@@ -74,7 +77,18 @@ X-Filename: photo.jpg
 Content-Type: image/jpeg
 Content-Length: …
 X-Sekai-Kind: image   # optional
+Authorization: Bearer <sekai-pass-token>   # required only when Content-Length > 512 MiB
 ```
+
+**Upload size tiers:**
+
+| Size | Requirement |
+|------|-------------|
+| ≤ 512 MiB | Anonymous (aligned with Cloudflare's cacheable object limit) |
+| 512 MiB – ~1GB | Valid **SEKAI Pass** access token (`Authorization: Bearer …`); missing/invalid → `401` |
+| > ~1GB | Rejected → `413` |
+
+> Cloudflare enforces a per-plan request-body limit (Free/Pro 100MB, Business 200MB, Enterprise 500MB by default). Uploads above that plan limit need an account-level increase regardless of this Worker's tiers.
 
 ```json
 {
@@ -108,11 +122,24 @@ Object layout (typical): `{PREFIX}/sekai/{uuid}{ext}` plus best-effort `{PREFIX}
 | GET/HEAD/DELETE | `/{key}` | Proxy |
 | * | `/chunked/…` | Chunked download/delete |
 
+## Content policy & abuse
+
+This is an **anonymous file service**. Arbitrary file types are allowed (including
+executables) — that is intentional, not an oversight. Stored objects are always served
+as downloads (`Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`), never
+rendered in the browser.
+
+Illegal content is prohibited and removed on report. To report abuse, email the address in
+`ABUSE_REPORT_EMAIL` (also shown in the root API docs) with the **public URL** and the
+**reason**. Do **not** attach or re-upload the offending content. See the Nightcord user
+terms for the governing policy.
+
 ## Security notes
 
 - Do **not** commit `wrangler.toml.local` or real `wrangler.toml` with production values.
 - Rotate any AccessKey that was ever pasted into chat, logs, or old commits.
 - Public `GET /v2/meta/{uuid}` does not return internal object keys.
+- Uploads over 512 MiB require a SEKAI Pass token (`AUTH_DB` binding); anonymous uploads never touch it.
 - Report vulnerabilities privately — see [SECURITY.md](./SECURITY.md).
 
 ## License

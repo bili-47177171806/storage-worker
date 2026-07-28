@@ -16,11 +16,15 @@
  * Do not hardcode bucket names, signing backends, or AccessKey material here.
  */
 
+import { authenticate } from "@25-ji-code-de/sekai-worker-kit";
+
 const SAFE_USERIDS = new Set(["public", "shared", "open"]);
 
 /** Non-secret runtime knobs that are not environment-specific. */
 const CHUNK_SIZE = 10 * 1024 * 1024;
-/** Soft cap aligned with local PostObject content-length-range. */
+/** Anonymous ceiling, aligned with Cloudflare's 512 MB cache object limit. */
+const ANON_MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
+/** Absolute upload ceiling for SEKAI Pass users; retained for compatibility. */
 const MAX_UPLOAD_BYTES = 1048576000;
 /** Extensions probed when v2 meta sidecar is missing (common first). */
 const SEKAI_PROBE_EXTS = [
@@ -45,9 +49,10 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Content-Type, X-Filename, X-Chunk-Index, X-Chunk-Total, " +
+    "Authorization, Content-Type, X-Filename, X-Chunk-Index, X-Chunk-Total, " +
     "X-File-ID, X-Original-Filename, X-File-Size, X-Safe-Path, " +
     "X-Sekai-Kind, X-Image-Width, X-Image-Height",
+  "Access-Control-Expose-Headers": "WWW-Authenticate",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -99,6 +104,7 @@ function cfg(env) {
     CHUNK_SIZE,
     PUBLIC_STORAGE_HOST: String(e.PUBLIC_STORAGE_HOST || "").trim().replace(/\/$/, ""),
     PUBLIC_R2_HOST: String(e.PUBLIC_R2_HOST || "").trim().replace(/\/$/, ""),
+    ABUSE_REPORT_EMAIL: String(e.ABUSE_REPORT_EMAIL || "").trim(),
     DELETE_ENABLED: String(e.DELETE_ENABLED || "").trim() === "1",
   };
 }
@@ -172,7 +178,7 @@ export default {
 
       // ── SEKAI v2 routes (path-based; works on any bound host) ──
       if (path === "v2/upload" && req.method === "PUT") {
-        return await putSekaiV2(req, c, ctx);
+        return await putSekaiV2(req, c, ctx, env);
       }
       if (path.startsWith("v2/meta/") && (req.method === "GET" || req.method === "HEAD")) {
         const uuid = path.slice("v2/meta/".length).split("/")[0];
@@ -188,9 +194,9 @@ export default {
       // ── Legacy ──
       switch (req.method) {
         case "PUT": {
-          if (req.headers.has("X-Chunk-Index")) return await putChunk(req, c);
-          if (req.headers.has("X-Safe-Path")) return await putSafe(req, c);
-          return await put(req, c);
+          if (req.headers.has("X-Chunk-Index")) return await putChunk(req, c, env);
+          if (req.headers.has("X-Safe-Path")) return await putSafe(req, c, env);
+          return await put(req, c, env);
         }
         case "GET":
         case "HEAD": {
@@ -300,6 +306,19 @@ function apiIndex(req, url, c) {
           h: "optional",
         },
         example: `curl -X PUT ${origin}/v2/upload -H "X-Filename: photo.jpg" -H "Content-Type: image/jpeg" --data-binary @photo.jpg`,
+        limits: {
+          anonymous_max_bytes: ANON_MAX_UPLOAD_BYTES,
+          authenticated_max_bytes: MAX_UPLOAD_BYTES,
+          note:
+            "Uploads up to 512 MiB are anonymous. Larger uploads (up to ~1GB) require a " +
+            "SEKAI Pass access token via 'Authorization: Bearer <token>'; without one they return 401. " +
+            "Over ~1GB returns 413. Note: Cloudflare per-plan request-body limits may cap large uploads " +
+            "below this (Free/Pro 100MB, Business 200MB, Enterprise 500MB default).",
+        },
+        auth: {
+          header: "Authorization: Bearer <sekai-pass-access-token>",
+          required_when: "Content-Length > 536870912 (512 MiB)",
+        },
       },
       resolve: {
         methods: ["GET", "HEAD"],
@@ -343,6 +362,18 @@ function apiIndex(req, url, c) {
       eligible:
         "Public media (images/files/stickers, legacy keys). Exclude / and /v2/* from cache eligibility.",
       see: "Cloudflare Cache Rules on storage.* and r2.*",
+    },
+    policy: {
+      summary:
+        "Anonymous file service. Arbitrary file types are allowed (including executables). " +
+        "Illegal content is prohibited and removed on report. Stored objects are served as " +
+        "downloads (Content-Disposition: attachment) with X-Content-Type-Options: nosniff.",
+      report:
+        "Report abuse or illegal content" +
+        (c && c.ABUSE_REPORT_EMAIL ? ` to ${c.ABUSE_REPORT_EMAIL}` : " via the configured abuse contact") +
+        ". Include the public URL and the reason. Do NOT attach or re-upload the offending content.",
+      report_email: (c && c.ABUSE_REPORT_EMAIL) || null,
+      terms: "https://nightcord.de5.net (see Nightcord user terms)",
     },
     links: {
       self_html: origin + "/",
@@ -432,6 +463,8 @@ function renderApiMarkdown(doc, origin) {
   lines.push("");
   lines.push("**Response fields:** `uuid`, `key` (=uuid), `type`, `size` (kB), `size_bytes`, `name`, `kind`, `url`, optional `w`/`h`.");
   lines.push("");
+  lines.push("**Size limits:** anonymous uploads up to **512 MiB**. Larger uploads (up to ~1GB) require a SEKAI Pass token via `Authorization: Bearer <token>` (else `401`); over ~1GB returns `413`. Cloudflare per-plan request-body limits may cap large uploads further.");
+  lines.push("");
   lines.push("**Example:**");
   lines.push("");
   lines.push("```bash");
@@ -470,6 +503,12 @@ function renderApiMarkdown(doc, origin) {
   lines.push(doc.caching.eligible);
   lines.push("");
   lines.push(`See: ${doc.caching.see}`);
+  lines.push("");
+  lines.push("## Content policy & abuse");
+  lines.push("");
+  lines.push(doc.policy.summary);
+  lines.push("");
+  lines.push(doc.policy.report);
   lines.push("");
   lines.push("## Alternate formats");
   lines.push("");
@@ -650,9 +689,11 @@ function renderApiHtml(doc, origin) {
     <table>
       <tr><th>Headers</th><td>
         <code>X-Filename</code>, <code>Content-Type</code>, <code>Content-Length</code><br/>
-        optional: <code>X-Sekai-Kind</code>, <code>X-Image-Width</code>, <code>X-Image-Height</code>
+        optional: <code>X-Sekai-Kind</code>, <code>X-Image-Width</code>, <code>X-Image-Height</code><br/>
+        for uploads &gt; 512 MiB: <code>Authorization: Bearer &lt;sekai-pass-token&gt;</code>
       </td></tr>
       <tr><th>Body</th><td>raw file bytes</td></tr>
+      <tr><th>Limits</th><td>Anonymous &le; <strong>512 MiB</strong>. Larger (up to ~1GB) needs a SEKAI Pass token (else <code>401</code>); over ~1GB &rarr; <code>413</code>. Cloudflare per-plan request-body limits may cap large uploads further.</td></tr>
       <tr><th>Response</th><td><code>uuid</code>, <code>type</code>, <code>size</code> (kB), <code>name</code>, <code>kind</code>, <code>url</code>, optional <code>w</code>/<code>h</code></td></tr>
     </table>
     <pre>${esc(doc.sekaiv2.upload.example)}</pre>
@@ -692,12 +733,51 @@ ${esc(doc.sekaiv2.message_payload.custom_stamp)}</pre>
     </ul>
   </section>
 
+  <section>
+    <h2>Content policy &amp; abuse</h2>
+    <p style="color:var(--muted);font-size:0.9rem;margin:0 0 8px">${esc(doc.policy.summary)}</p>
+    <p style="color:var(--muted);font-size:0.9rem;margin:0">${esc(doc.policy.report)}</p>
+  </section>
+
   <footer>
     Nightcord storage worker · SEKAI resource facade · same Worker on storage.* and r2.*
   </footer>
 </main>
 </body>
 </html>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  上传大小分档 + 鉴权
+ *
+ *  匿名 ≤ ANON_MAX_UPLOAD_BYTES（512 MiB，对齐 Cloudflare 缓存对象上限）。
+ *  (ANON, MAX] 需要有效的 SEKAI Pass Bearer token（查 env.AUTH_DB）。
+ *  > MAX 一律拒绝。
+ *
+ *  只读**声明大小**（Content-Length / X-File-Size），不缓冲 body。
+ *  只有当声明大小超过匿名档时才碰 AUTH_DB —— 匿名小文件不产生 D1 查询。
+ * ═══════════════════════════════════════════════════════ */
+
+/**
+ * @param {Request} req
+ * @param {object} env  平台 bindings（大文件时需含 AUTH_DB）
+ * @param {number} declaredSize  声明的字节数
+ * @param {string} [invalidMsg]  非法大小时的错误文案
+ * @returns {Promise<Response|null>} null 表示放行；Response 表示拒绝
+ */
+async function authorizeUploadSize(req, env, declaredSize, invalidMsg) {
+  if (!Number.isFinite(declaredSize) || declaredSize < 0) {
+    return fail(400, invalidMsg || "Invalid Content-Length");
+  }
+  if (declaredSize > MAX_UPLOAD_BYTES) {
+    return fail(413, "Payload Too Large");
+  }
+  if (declaredSize <= ANON_MAX_UPLOAD_BYTES) return null; // 匿名档：不查 D1
+  const user = await authenticate(req, env);
+  if (!user) {
+    return fail(401, "SEKAI Pass required for uploads over 512 MiB");
+  }
+  return null;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -749,7 +829,7 @@ async function persistSekaiMeta(c, meta) {
  * OSS: AttachFiles/sekai/{uuid}{ext}
  * Meta: AttachFiles/sekai/{uuid}.json (async via waitUntil — does not block 200)
  */
-async function putSekaiV2(req, c, ctx) {
+async function putSekaiV2(req, c, ctx, env) {
   if (!c.AKID) return fail(500, "OSS_AKID not configured");
 
   const encodedName = (req.headers.get("X-Filename") || "file").trim();
@@ -759,9 +839,8 @@ async function putSekaiV2(req, c, ctx) {
   const fSizeStr = req.headers.get("Content-Length");
   if (!fSizeStr) return fail(400);
   const fileSize = parseInt(fSizeStr, 10);
-  if (!Number.isFinite(fileSize) || fileSize < 0 || fileSize > MAX_UPLOAD_BYTES) {
-    return fail(400, "Invalid Content-Length");
-  }
+  const sizeErr = await authorizeUploadSize(req, env, fileSize);
+  if (sizeErr) return sizeErr;
 
   if (/\.\.|\/\/|[\x00-\x1f]/.test(rawName)) return fail(400);
 
@@ -912,7 +991,7 @@ async function getSekaiMeta(req, c, uuid) {
 /* ═══════════════════════════════════════════════════════
  *  PUT — 安全路径直传
  * ═══════════════════════════════════════════════════════ */
-async function putSafe(req, c) {
+async function putSafe(req, c, env) {
   const safePath = (req.headers.get("X-Safe-Path") || "").trim();
   const encodedName = (req.headers.get("X-Filename") || "file").trim();
   const rawName = safeDecodeFilename(encodedName);
@@ -921,9 +1000,8 @@ async function putSafe(req, c) {
   const fSizeStr = req.headers.get("Content-Length");
   if (!fSizeStr) return fail(400);
   const fileSize = parseInt(fSizeStr, 10);
-  if (!Number.isFinite(fileSize) || fileSize < 0 || fileSize > MAX_UPLOAD_BYTES) {
-    return fail(400, "Invalid Content-Length");
-  }
+  const sizeErr = await authorizeUploadSize(req, env, fileSize);
+  if (sizeErr) return sizeErr;
 
   const safeId = getSafeId(safePath);
   if (!safeId) {
@@ -975,7 +1053,7 @@ async function putSafe(req, c) {
 /* ═══════════════════════════════════════════════════════
  *  PUT — 单文件直传 (legacy)
  * ═══════════════════════════════════════════════════════ */
-async function put(req, c) {
+async function put(req, c, env) {
   const encodedName = (req.headers.get("X-Filename") || "file").trim();
   const rawName = safeDecodeFilename(encodedName);
   if (!rawName) return fail(400, "Invalid X-Filename");
@@ -983,9 +1061,8 @@ async function put(req, c) {
   const fSizeStr = req.headers.get("Content-Length");
   if (!fSizeStr) return fail(400);
   const fileSize = parseInt(fSizeStr, 10);
-  if (!Number.isFinite(fileSize) || fileSize < 0 || fileSize > MAX_UPLOAD_BYTES) {
-    return fail(400, "Invalid Content-Length");
-  }
+  const sizeErr = await authorizeUploadSize(req, env, fileSize);
+  if (sizeErr) return sizeErr;
 
   const uid = crypto.randomUUID();
   const ext = extOf(rawName);
@@ -1016,7 +1093,7 @@ async function put(req, c) {
 /* ═══════════════════════════════════════════════════════
  *  PUT — 分片上传
  * ═══════════════════════════════════════════════════════ */
-async function putChunk(req, c) {
+async function putChunk(req, c, env) {
   const fileId = (req.headers.get("X-File-ID") || "").trim();
   const indexStr = (req.headers.get("X-Chunk-Index") || "").trim();
   const totalStr = (req.headers.get("X-Chunk-Total") || "").trim();
@@ -1034,9 +1111,11 @@ async function putChunk(req, c) {
 
   if (isNaN(index) || isNaN(total) || isNaN(chunkSize) || isNaN(fileSize)) return fail(400);
   if (index < 0 || index >= total || total < 1 || total > 10000) return fail(400);
-  if (chunkSize < 0 || chunkSize > MAX_UPLOAD_BYTES || fileSize < 0 || fileSize > MAX_UPLOAD_BYTES) {
-    return fail(400, "Invalid size");
-  }
+  // 单片本身也不能超过绝对上限（防单请求异常大）
+  if (chunkSize < 0 || chunkSize > MAX_UPLOAD_BYTES) return fail(400, "Invalid size");
+  // 按**总文件**大小分档鉴权：> 512 MiB 的整体上传每片都要带 SEKAI Pass
+  const sizeErr = await authorizeUploadSize(req, env, fileSize, "Invalid size");
+  if (sizeErr) return sizeErr;
   // Basic fileId hygiene — used in OSS keys
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(fileId)) return fail(400, "Invalid X-File-ID");
 
@@ -1142,7 +1221,7 @@ async function signPolicyLocal(c, userid) {
   const policyObj = {
     expiration,
     conditions: [
-      ["content-length-range", 0, 1048576000],
+      ["content-length-range", 0, MAX_UPLOAD_BYTES],
       ["starts-with", "$key", `${c.PREFIX}/${userid}/`],
     ],
   };
@@ -1793,22 +1872,27 @@ function fail(status, detail) {
     detail ||
     {
       400: "Bad Request",
+      401: "Unauthorized",
       403: "Forbidden",
       404: "Not Found",
       405: "Method Not Allowed",
+      413: "Payload Too Large",
       416: "Range Not Satisfiable",
       500: "Internal Server Error",
       502: "Bad Gateway",
     }[status] ||
     "Error";
-  return new Response(JSON.stringify({ error: msg }), {
-    status,
-    headers: {
-      "Content-Type": "application/json;charset=utf-8",
-      "Access-Control-Allow-Origin": "*",
-      "X-Content-Type-Options": "nosniff",
-    },
-  });
+  const headers = {
+    "Content-Type": "application/json;charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+    "X-Content-Type-Options": "nosniff",
+  };
+  // RFC 6750 §3：Bearer 保护的资源 401 必须给挑战头，并暴露给浏览器脚本。
+  if (status === 401) {
+    headers["WWW-Authenticate"] = "Bearer";
+    headers["Access-Control-Expose-Headers"] = "WWW-Authenticate";
+  }
+  return new Response(JSON.stringify({ error: msg }), { status, headers });
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -1820,6 +1904,7 @@ function fail(status, detail) {
 export {
   CORS_HEADERS,
   SAFE_USERIDS,
+  ANON_MAX_UPLOAD_BYTES,
   MAX_UPLOAD_BYTES,
   UUID_RE,
   cfg,

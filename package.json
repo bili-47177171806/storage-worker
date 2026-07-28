@@ -1,0 +1,14 @@
+{
+  "name": "storage-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker: Aliyun OSS proxy + SEKAI v2 upload facade",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "check": "node --check worker.js && npm test"
+  },
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "@25-ji-code-de/sekai-worker-kit": "github:25-ji-code-de/sekai-worker-kit#v0.1.1"
+  }
+}
