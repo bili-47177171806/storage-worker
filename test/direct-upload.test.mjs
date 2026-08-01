@@ -12,9 +12,9 @@ const ENV = {
   PUBLIC_UPLOAD_HOST: 'https://upload.example.com/',
 };
 
-const OBJECT_META_ENV = {
+const LEGACY_JSON_ENV = {
   ...ENV,
-  DIRECT_UPLOAD_OBJECT_METADATA: '1',
+  DIRECT_UPLOAD_OBJECT_METADATA: '0',
 };
 
 function jsonRequest(path, body, headers = {}) {
@@ -47,7 +47,8 @@ describe('direct upload init', () => {
     assert.equal(result.upload.method, 'POST');
     assert.equal(result.upload.fields.success_action_status, '204');
     assert.equal(result.upload.fields.OSSAccessKeyId, 'access-id');
-    assert.match(result.upload.fields.key, /^AttachFiles\/sekai\/[0-9a-f-]+\.jpg$/);
+    assert.match(result.upload.fields.key, /^AttachFiles\/sekai\/[0-9a-f-]+$/);
+    assert.equal(result.upload.fields['x-oss-meta-sekai-version'], '2');
     assert.equal(result.url, `/images/${result.uuid}`);
     assert.ok(result.complete_token.includes('.'));
 
@@ -85,6 +86,22 @@ describe('direct upload init', () => {
     );
     assert.equal(response.status, 401);
   });
+
+  test('can explicitly roll back to the JSON sidecar layout', async () => {
+    const response = await worker.fetch(
+      jsonRequest('/v2/upload/init', {
+        name: 'photo.JPG',
+        type: 'image/jpeg',
+        size: 12345,
+      }),
+      LEGACY_JSON_ENV,
+      {},
+    );
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.match(result.upload.fields.key, /^AttachFiles\/sekai\/[0-9a-f-]+\.jpg$/);
+    assert.equal(result.upload.fields['x-oss-meta-sekai-version'], undefined);
+  });
 });
 
 describe('direct upload complete', () => {
@@ -113,7 +130,7 @@ describe('direct upload complete', () => {
         type: 'application/octet-stream',
         size: 8,
       }),
-      ENV,
+      LEGACY_JSON_ENV,
       {},
     );
     const init = await initResponse.json();
@@ -145,7 +162,7 @@ describe('direct upload complete', () => {
     try {
       const response = await worker.fetch(
         jsonRequest('/v2/upload/complete', { token: init.complete_token }),
-        ENV,
+        LEGACY_JSON_ENV,
         { waitUntil(promise) { backgroundTask = promise; } },
       );
 
@@ -161,7 +178,7 @@ describe('direct upload complete', () => {
   });
 });
 
-describe('experimental OSS object metadata layout', () => {
+describe('default OSS object metadata layout', () => {
   test('signs an extensionless key and every metadata field exactly', async () => {
     const response = await worker.fetch(
       jsonRequest('/v2/upload/init', {
@@ -172,7 +189,7 @@ describe('experimental OSS object metadata layout', () => {
         w: 320,
         h: 180,
       }),
-      OBJECT_META_ENV,
+      ENV,
       {},
     );
     assert.equal(response.status, 200);
@@ -207,7 +224,7 @@ describe('experimental OSS object metadata layout', () => {
         size: 12,
         kind: 'file',
       }),
-      OBJECT_META_ENV,
+      ENV,
       {},
     );
     const init = await initResponse.json();
@@ -235,7 +252,7 @@ describe('experimental OSS object metadata layout', () => {
     try {
       const response = await worker.fetch(
         jsonRequest('/v2/upload/complete', { token: init.complete_token }),
-        OBJECT_META_ENV,
+        ENV,
         { waitUntil(promise) { backgroundTask = promise; } },
       );
       assert.equal(response.status, 200);
@@ -270,7 +287,7 @@ describe('experimental OSS object metadata layout', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://storage.example.com/v2/meta/${uuid}`),
-        OBJECT_META_ENV,
+        ENV,
         {},
       );
       assert.equal(response.status, 200);

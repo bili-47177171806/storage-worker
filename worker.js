@@ -116,7 +116,7 @@ function cfg(env) {
     ABUSE_REPORT_EMAIL: String(e.ABUSE_REPORT_EMAIL || "").trim(),
     TERMS_URL: String(e.TERMS_URL || "").trim(),
     DIRECT_UPLOAD_OBJECT_METADATA:
-      String(e.DIRECT_UPLOAD_OBJECT_METADATA || "").trim() === "1",
+      String(e.DIRECT_UPLOAD_OBJECT_METADATA ?? "1").trim() !== "0",
     DELETE_ENABLED: String(e.DELETE_ENABLED || "").trim() === "1",
   };
 }

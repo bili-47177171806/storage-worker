@@ -43,6 +43,7 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 | `OSS_UPLOAD_HOST` | no | `[vars]` | Upload origin; empty → regional host |
 | `PUBLIC_UPLOAD_HOST` | direct upload | `[vars]` | Public upload gateway, for example `https://upload.example.com` |
 | `UPLOAD_TOKEN_SECRET` | no | **secret** | Separate HMAC secret for completion tokens; falls back to `OSS_AKS` |
+| `DIRECT_UPLOAD_OBJECT_METADATA` | no | `[vars]` | Object Metadata is enabled by default; set to `0` to use legacy JSON sidecars |
 | `OSS_PUT_MODE` | no | `[vars]` | `auto` (default) / `put` / `post` |
 | `SIGN_BACKEND` | no* | `[vars]` | Remote policy API if `OSS_AKS` unset |
 | `PUBLIC_STORAGE_HOST` | no | `[vars]` | Docs only |
