@@ -12,6 +12,11 @@ const ENV = {
   PUBLIC_UPLOAD_HOST: 'https://upload.example.com/',
 };
 
+const OBJECT_META_ENV = {
+  ...ENV,
+  DIRECT_UPLOAD_OBJECT_METADATA: '1',
+};
+
 function jsonRequest(path, body, headers = {}) {
   return new Request(`https://storage.example.com${path}`, {
     method: 'POST',
@@ -151,6 +156,137 @@ describe('direct upload complete', () => {
       await backgroundTask;
     } finally {
       releaseMetadata?.();
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe('experimental OSS object metadata layout', () => {
+  test('signs an extensionless key and every metadata field exactly', async () => {
+    const response = await worker.fetch(
+      jsonRequest('/v2/upload/init', {
+        name: '测试图片.PNG',
+        type: 'image/png',
+        size: 4096,
+        kind: 'image',
+        w: 320,
+        h: 180,
+      }),
+      OBJECT_META_ENV,
+      {},
+    );
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    const fields = result.upload.fields;
+
+    assert.match(fields.key, /^AttachFiles\/sekai\/[0-9a-f-]+$/);
+    assert.equal(fields['x-oss-meta-sekai-version'], '2');
+    assert.equal(
+      Buffer.from(fields['x-oss-meta-sekai-name'], 'base64url').toString('utf8'),
+      '测试图片.PNG',
+    );
+    assert.equal(fields['x-oss-meta-sekai-kind'], 'image');
+    assert.equal(fields['x-oss-meta-sekai-width'], '320');
+    assert.equal(fields['x-oss-meta-sekai-height'], '180');
+
+    const policy = JSON.parse(Buffer.from(fields.policy, 'base64').toString('utf8'));
+    for (const [name, value] of Object.entries(fields)) {
+      if (!name.startsWith('x-oss-meta-')) continue;
+      assert.ok(
+        policy.conditions.some((condition) => condition[name] === value),
+        `${name} must be constrained by the signed policy`,
+      );
+    }
+  });
+
+  test('complete verifies object metadata without writing a JSON sidecar', async () => {
+    const initResponse = await worker.fetch(
+      jsonRequest('/v2/upload/init', {
+        name: '测试.txt',
+        type: 'text/plain',
+        size: 12,
+        kind: 'file',
+      }),
+      OBJECT_META_ENV,
+      {},
+    );
+    const init = await initResponse.json();
+    const fields = init.upload.fields;
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    let backgroundTask;
+
+    globalThis.fetch = async (_url, options = {}) => {
+      fetchCalls++;
+      assert.equal(options.method, 'HEAD');
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'Content-Length': '12',
+          'Content-Type': 'text/plain',
+          'x-oss-meta-sekai-version': fields['x-oss-meta-sekai-version'],
+          'x-oss-meta-sekai-name': fields['x-oss-meta-sekai-name'],
+          'x-oss-meta-sekai-kind': fields['x-oss-meta-sekai-kind'],
+          'x-oss-meta-sekai-created': fields['x-oss-meta-sekai-created'],
+        },
+      });
+    };
+
+    try {
+      const response = await worker.fetch(
+        jsonRequest('/v2/upload/complete', { token: init.complete_token }),
+        OBJECT_META_ENV,
+        { waitUntil(promise) { backgroundTask = promise; } },
+      );
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).name, '测试.txt');
+      assert.equal(fetchCalls, 1);
+      assert.equal(backgroundTask, undefined);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('serves the existing meta response shape from object headers', async () => {
+    const uuid = '01234567-89ab-4def-8123-456789abcdef';
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_url, options = {}) => {
+      assert.equal(options.method, 'HEAD');
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'Content-Length': '2048',
+          'Content-Type': 'image/png',
+          'x-oss-meta-sekai-version': '2',
+          'x-oss-meta-sekai-name': Buffer.from('图片.png').toString('base64url'),
+          'x-oss-meta-sekai-kind': 'image',
+          'x-oss-meta-sekai-created': '1785600000',
+          'x-oss-meta-sekai-width': '640',
+          'x-oss-meta-sekai-height': '480',
+        },
+      });
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request(`https://storage.example.com/v2/meta/${uuid}`),
+        OBJECT_META_ENV,
+        {},
+      );
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), {
+        uuid,
+        kind: 'image',
+        type: 'image/png',
+        name: '图片.png',
+        size_bytes: 2048,
+        size: 2,
+        ext: '.png',
+        created: new Date(1785600000 * 1000).toISOString(),
+        w: 640,
+        h: 480,
+      });
+    } finally {
       globalThis.fetch = originalFetch;
     }
   });

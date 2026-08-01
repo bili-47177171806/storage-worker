@@ -115,6 +115,8 @@ function cfg(env) {
     PUBLIC_R2_HOST: String(e.PUBLIC_R2_HOST || "").trim().replace(/\/$/, ""),
     ABUSE_REPORT_EMAIL: String(e.ABUSE_REPORT_EMAIL || "").trim(),
     TERMS_URL: String(e.TERMS_URL || "").trim(),
+    DIRECT_UPLOAD_OBJECT_METADATA:
+      String(e.DIRECT_UPLOAD_OBJECT_METADATA || "").trim() === "1",
     DELETE_ENABLED: String(e.DELETE_ENABLED || "").trim() === "1",
   };
 }
@@ -975,7 +977,14 @@ async function readJson(req, maxBytes = 16 * 1024) {
   }
 }
 
-async function signDirectUploadPolicy(c, ossKey, fileSize, contentType, cdValue) {
+async function signDirectUploadPolicy(
+  c,
+  ossKey,
+  fileSize,
+  contentType,
+  cdValue,
+  objectMetadata = {},
+) {
   const expiresAt = Math.floor(Date.now() / 1000) + DIRECT_UPLOAD_TTL_SECONDS;
   const policyObj = {
     expiration: new Date(expiresAt * 1000).toISOString(),
@@ -984,6 +993,7 @@ async function signDirectUploadPolicy(c, ossKey, fileSize, contentType, cdValue)
       ["content-length-range", fileSize, fileSize],
       { "Content-Type": contentType },
       { "Content-Disposition": cdValue },
+      ...Object.entries(objectMetadata).map(([name, value]) => ({ [name]: value })),
     ],
   };
   const policy = bufToBase64(new TextEncoder().encode(JSON.stringify(policyObj)));
@@ -1009,6 +1019,66 @@ function sekaiPublicPath(kind, uuid) {
   return `/${kind === "sticker" ? "stickers" : kind === "image" ? "images" : "files"}/${uuid}`;
 }
 
+function encodeObjectMetaText(value) {
+  return base64UrlEncode(new TextEncoder().encode(String(value || "")));
+}
+
+function decodeObjectMetaText(value) {
+  try {
+    return new TextDecoder().decode(base64UrlDecode(value));
+  } catch {
+    return null;
+  }
+}
+
+function buildDirectObjectMetadata({ name, kind, created, w, h }) {
+  return {
+    "x-oss-meta-sekai-version": "2",
+    "x-oss-meta-sekai-name": encodeObjectMetaText(name),
+    "x-oss-meta-sekai-kind": kind,
+    "x-oss-meta-sekai-created": String(created),
+    ...(w ? { "x-oss-meta-sekai-width": String(w) } : {}),
+    ...(h ? { "x-oss-meta-sekai-height": String(h) } : {}),
+  };
+}
+
+function metaFromObjectHeaders(uuid, ossKey, headers) {
+  if (headers.get("x-oss-meta-sekai-version") !== "2") return null;
+  const name = decodeObjectMetaText(headers.get("x-oss-meta-sekai-name"));
+  const kind = headers.get("x-oss-meta-sekai-kind") || "file";
+  const rawCreated = headers.get("x-oss-meta-sekai-created");
+  const createdSeconds = Number(rawCreated);
+  const rawSize = headers.get("Content-Length");
+  const sizeBytes = Number(rawSize);
+  const w = Number(headers.get("x-oss-meta-sekai-width"));
+  const h = Number(headers.get("x-oss-meta-sekai-height"));
+  if (
+    !name ||
+    rawCreated === null ||
+    rawSize === null ||
+    !Number.isFinite(sizeBytes) ||
+    sizeBytes < 0 ||
+    !Number.isSafeInteger(createdSeconds) ||
+    createdSeconds <= 0 ||
+    !Number.isFinite(new Date(createdSeconds * 1000).getTime())
+  ) {
+    return null;
+  }
+  return {
+    uuid,
+    kind: kind === "image" || kind === "sticker" ? kind : "file",
+    type: headers.get("Content-Type") || "application/octet-stream",
+    name,
+    size_bytes: sizeBytes,
+    size: Math.round((sizeBytes / 1024) * 10) / 10,
+    ext: extOf(name),
+    ossKey,
+    created: new Date(createdSeconds * 1000).toISOString(),
+    ...(Number.isInteger(w) && w > 0 ? { w } : {}),
+    ...(Number.isInteger(h) && h > 0 ? { h } : {}),
+  };
+}
+
 async function initSekaiV2Upload(req, c, env) {
   if (!(c.AKS && c.PUBLIC_UPLOAD_HOST && c.UPLOAD_TOKEN_SECRET)) {
     return fail(501, "Direct upload is not configured");
@@ -1031,17 +1101,29 @@ async function initSekaiV2Upload(req, c, env) {
   const uuid = crypto.randomUUID();
   const kind = inferKind(contentType, input.kind);
   const ext = extOf(rawName);
-  const ossKey = `${c.PREFIX}/sekai/${uuid}${ext}`;
+  const objectMetaLayout = c.DIRECT_UPLOAD_OBJECT_METADATA;
+  const ossKey = `${c.PREFIX}/sekai/${uuid}${objectMetaLayout ? "" : ext}`;
   const display = sanitize(rawName);
   const cdValue = buildContentDisposition(display);
-  const direct = await signDirectUploadPolicy(c, ossKey, fileSize, contentType, cdValue);
 
   let w = Number(input.w);
   let h = Number(input.h);
   if (!Number.isInteger(w) || w <= 0) w = undefined;
   if (!Number.isInteger(h) || h <= 0) h = undefined;
+  const created = Math.floor(Date.now() / 1000);
+  const objectMetadata = objectMetaLayout
+    ? buildDirectObjectMetadata({ name: rawName, kind, created, w, h })
+    : {};
+  const direct = await signDirectUploadPolicy(
+    c,
+    ossKey,
+    fileSize,
+    contentType,
+    cdValue,
+    objectMetadata,
+  );
   const tokenPayload = {
-    v: 1,
+    v: objectMetaLayout ? 2 : 1,
     exp: direct.expiresAt + 15 * 60,
     uuid,
     kind,
@@ -1050,6 +1132,7 @@ async function initSekaiV2Upload(req, c, env) {
     size: fileSize,
     ext,
     ossKey,
+    ...(objectMetaLayout ? { created } : {}),
     ...(w ? { w } : {}),
     ...(h ? { h } : {}),
   };
@@ -1070,6 +1153,7 @@ async function initSekaiV2Upload(req, c, env) {
         success_action_status: "204",
         "Content-Type": contentType,
         "Content-Disposition": cdValue,
+        ...objectMetadata,
       },
     },
     complete_token: await createUploadToken(c, tokenPayload),
@@ -1080,10 +1164,11 @@ async function completeSekaiV2Upload(req, c, ctx) {
   if (!(c.AKS && c.UPLOAD_TOKEN_SECRET)) return fail(501, "Direct upload is not configured");
   const input = await readJson(req);
   const payload = input && await verifyUploadToken(c, input.token);
-  if (!payload || payload.v !== 1 || !UUID_RE.test(payload.uuid)) {
+  if (!payload || (payload.v !== 1 && payload.v !== 2) || !UUID_RE.test(payload.uuid)) {
     return fail(400, "Invalid or expired upload token");
   }
-  if (payload.ossKey !== `${c.PREFIX}/sekai/${payload.uuid}${payload.ext || ""}`) {
+  const expectedKey = `${c.PREFIX}/sekai/${payload.uuid}${payload.v === 2 ? "" : payload.ext || ""}`;
+  if (payload.ossKey !== expectedKey) {
     return fail(400, "Invalid upload token");
   }
 
@@ -1098,9 +1183,23 @@ async function completeSekaiV2Upload(req, c, ctx) {
   }
   const storedSize = Number(head.headers.get("Content-Length"));
   const storedType = head.headers.get("Content-Type") || "";
+  const storedObjectMeta = payload.v === 2
+    ? metaFromObjectHeaders(payload.uuid, payload.ossKey, head.headers)
+    : null;
   await drain(head);
   if (storedSize !== payload.size) return fail(409, "Uploaded object size does not match");
   if (storedType && storedType !== payload.type) return fail(409, "Uploaded object type does not match");
+  if (
+    payload.v === 2 &&
+    (!storedObjectMeta ||
+      storedObjectMeta.name !== payload.name ||
+      storedObjectMeta.kind !== payload.kind ||
+      storedObjectMeta.created !== new Date(payload.created * 1000).toISOString() ||
+      (payload.w || undefined) !== storedObjectMeta.w ||
+      (payload.h || undefined) !== storedObjectMeta.h)
+  ) {
+    return fail(409, "Uploaded object metadata does not match");
+  }
 
   const sizeKb = Math.round((payload.size / 1024) * 10) / 10;
   const meta = {
@@ -1116,7 +1215,7 @@ async function completeSekaiV2Upload(req, c, ctx) {
     ...(payload.w ? { w: payload.w } : {}),
     ...(payload.h ? { h: payload.h } : {}),
   };
-  scheduleSekaiMeta(c, meta, ctx);
+  if (payload.v === 1) scheduleSekaiMeta(c, meta, ctx);
 
   return ok({
     uuid: payload.uuid,
@@ -1223,6 +1322,16 @@ async function putSekaiV2(req, c, ctx, env) {
 
 async function loadSekaiMeta(c, uuid) {
   if (!UUID_RE.test(uuid)) return null;
+  const objectKey = `${c.PREFIX}/sekai/${uuid}`;
+  const objectHead = await fetch(`${c.OSS_HOST}/${objectKey}`, { method: "HEAD" });
+  if (objectHead.ok) {
+    const objectMeta = metaFromObjectHeaders(uuid, objectKey, objectHead.headers);
+    await drain(objectHead);
+    if (objectMeta) return objectMeta;
+  } else {
+    await drain(objectHead);
+  }
+
   const metaKey = `${c.PREFIX}/sekai/${uuid}.json`;
   const r = await fetch(`${c.OSS_HOST}/${metaKey}`);
   if (r.status === 404) {
