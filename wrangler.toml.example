@@ -1,8 +1,8 @@
-# Example Wrangler config — copy to wrangler.toml.local (gitignored) for deploy.
-#   cp wrangler.toml.example wrangler.toml.local
-#   npx wrangler secret put OSS_AKID -c wrangler.toml.local
-#   npx wrangler secret put OSS_AKS  -c wrangler.toml.local
-#   npx wrangler deploy -c wrangler.toml.local
+# Example Wrangler config — copy to wrangler.local.toml (gitignored) for deploy.
+#   cp wrangler.toml.example wrangler.local.toml
+#   npx wrangler secret put OSS_AKID -c wrangler.local.toml
+#   npx wrangler secret put OSS_AKS  -c wrangler.local.toml
+#   npx wrangler deploy -c wrangler.local.toml
 #
 # Never commit AccessKey Id/Secret or real production hostnames.
 
@@ -15,17 +15,21 @@ OSS_BUCKET = "your-bucket-name"
 OSS_ENDPOINT = "oss-cn-hangzhou.aliyuncs.com"
 OSS_PREFIX = "AttachFiles"
 OSS_UPLOAD_HOST = ""
+PUBLIC_UPLOAD_HOST = "https://upload.example.com"
+# Optional: npx wrangler secret put UPLOAD_TOKEN_SECRET -c wrangler.local.toml
+# If omitted, direct-upload completion tokens use OSS_AKS as the HMAC secret.
 # auto | put | post  (when OSS_AKS is set)
 OSS_PUT_MODE = "auto"
 # SIGN_BACKEND = "https://sign.example.com"  # only if OSS_AKS unset
 PUBLIC_STORAGE_HOST = "https://storage.example.com"
 PUBLIC_R2_HOST = "https://media.example.com"
+TERMS_URL = "https://example.com/terms"
 # Abuse reports mailbox (shown in API docs / README). Leave unset until you have one.
 # ABUSE_REPORT_EMAIL = "abuse@example.com"
 
 # SEKAI Pass D1 — required only for uploads above the 512 MiB anonymous cap.
 # Anonymous uploads (<= 512 MiB) do not touch this binding.
-# Point at the shared sekai_pass_db; put the real database_id in wrangler.toml.local.
+# Point at the shared sekai_pass_db; put the real database_id in wrangler.local.toml.
 [[d1_databases]]
 binding = "AUTH_DB"
 database_name = "sekai_pass_db"

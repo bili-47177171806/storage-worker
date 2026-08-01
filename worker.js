@@ -8,6 +8,7 @@
  *
  * SEKAI v2 facade (additive):
  *   PUT /v2/upload
+ *   POST /v2/upload/init | /v2/upload/complete
  *   GET|HEAD /images/{uuid} | /files/{uuid} | /stickers/{uuid}
  *   GET /v2/meta/{uuid}
  *
@@ -26,6 +27,8 @@ const CHUNK_SIZE = 10 * 1024 * 1024;
 const ANON_MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
 /** Absolute upload ceiling for SEKAI Pass users; retained for compatibility. */
 const MAX_UPLOAD_BYTES = 1048576000;
+/** Short-lived direct-upload form and completion token lifetime. */
+const DIRECT_UPLOAD_TTL_SECONDS = 2 * 60 * 60;
 /** Extensions probed when v2 meta sidecar is missing (common first). */
 const SEKAI_PROBE_EXTS = [
   "",
@@ -47,7 +50,7 @@ const SEKAI_PROBE_EXTS = [
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, HEAD, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers":
     "Authorization, Content-Type, X-Filename, X-Chunk-Index, X-Chunk-Total, " +
     "X-File-ID, X-Original-Filename, X-File-Size, X-Safe-Path, " +
@@ -76,7 +79,9 @@ const UUID_RE =
  * Optional:
  *   SIGN_BACKEND — fallback only when OSS_AKS is unset
  *   OSS_UPLOAD_HOST — upload host (CDN/custom). Empty → regional OSS_HOST
- *   PUBLIC_STORAGE_HOST / PUBLIC_R2_HOST — GET / docs text only
+ *   PUBLIC_UPLOAD_HOST — browser-facing direct-upload gateway
+ *   UPLOAD_TOKEN_SECRET — HMAC secret for direct-upload completion tokens
+ *   PUBLIC_STORAGE_HOST / PUBLIC_R2_HOST / TERMS_URL — GET / docs text only
  */
 function cfg(env) {
   const e = env || {};
@@ -89,6 +94,8 @@ function cfg(env) {
   const OSS_HOST = BUCKET && ENDPOINT ? `https://${BUCKET}.${ENDPOINT}` : "";
   const rawUpload = String(e.OSS_UPLOAD_HOST || e.OSS_UPLOAD_ENDPOINT || "").trim();
   const UPLOAD_HOST = rawUpload.replace(/\/$/, "") || OSS_HOST;
+  const PUBLIC_UPLOAD_HOST = String(e.PUBLIC_UPLOAD_HOST || "").trim().replace(/\/$/, "");
+  const UPLOAD_TOKEN_SECRET = String(e.UPLOAD_TOKEN_SECRET || "").trim() || AKS;
   // Prefer PutObject when we have SK (simpler stream, no multipart). Can force PostObject with OSS_PUT_MODE=post
   const putMode = String(e.OSS_PUT_MODE || "auto").trim().toLowerCase();
   return {
@@ -100,11 +107,14 @@ function cfg(env) {
     PREFIX,
     OSS_HOST,
     UPLOAD_HOST,
+    PUBLIC_UPLOAD_HOST,
+    UPLOAD_TOKEN_SECRET,
     PUT_MODE: putMode, // auto | put | post
     CHUNK_SIZE,
     PUBLIC_STORAGE_HOST: String(e.PUBLIC_STORAGE_HOST || "").trim().replace(/\/$/, ""),
     PUBLIC_R2_HOST: String(e.PUBLIC_R2_HOST || "").trim().replace(/\/$/, ""),
     ABUSE_REPORT_EMAIL: String(e.ABUSE_REPORT_EMAIL || "").trim(),
+    TERMS_URL: String(e.TERMS_URL || "").trim(),
     DELETE_ENABLED: String(e.DELETE_ENABLED || "").trim() === "1",
   };
 }
@@ -179,6 +189,12 @@ export default {
       // ── SEKAI v2 routes (path-based; works on any bound host) ──
       if (path === "v2/upload" && req.method === "PUT") {
         return await putSekaiV2(req, c, ctx, env);
+      }
+      if (path === "v2/upload/init" && req.method === "POST") {
+        return await initSekaiV2Upload(req, c, env);
+      }
+      if (path === "v2/upload/complete" && req.method === "POST") {
+        return await completeSekaiV2Upload(req, c, ctx);
       }
       if (path.startsWith("v2/meta/") && (req.method === "GET" || req.method === "HEAD")) {
         const uuid = path.slice("v2/meta/".length).split("/")[0];
@@ -270,21 +286,47 @@ function apiIndex(req, url, c) {
   const format = negotiateDocsFormat(req, url);
   const storageHost = (c && c.PUBLIC_STORAGE_HOST) || origin;
   const r2Host = (c && c.PUBLIC_R2_HOST) || origin;
+  const uploadHost = (c && c.PUBLIC_UPLOAD_HOST) || null;
 
   const doc = {
     service: "Nightcord Storage",
     version: "2.0.0",
     description:
-      "Object storage proxy with SEKAI v2 resource facade. Legacy upload paths remain; new clients should prefer /v2/upload and typed resolve URLs.",
+      "Object storage proxy with SEKAI v2 resource facade. New clients should use the direct-upload flow; legacy upload paths remain compatible.",
     hosts: {
       storage: storageHost,
       r2: r2Host,
-      note: "Both hosts hit this Worker when bound. Prefer the media host for public SEKAI GETs; uploads may use either host.",
+      upload: uploadHost,
+      note: "The storage host signs and confirms uploads. File bytes go directly through the dedicated upload host to OSS; public media resolves through the storage or media host.",
     },
     sekaiv2: {
+      direct_upload: {
+        preferred: true,
+        steps: [
+          {
+            method: "POST",
+            path: "/v2/upload/init",
+            body: { name: "photo.jpg", type: "image/jpeg", size: 209408, kind: "image" },
+            note: "Returns an exact-key, exact-size OSS PostObject form and a completion token.",
+          },
+          {
+            method: "POST",
+            url: uploadHost || "value returned as upload.url",
+            body: "multipart/form-data: append every upload.fields entry, then append file last",
+            note: "File bytes go through the dedicated upload gateway directly to OSS without traversing this Worker.",
+          },
+          {
+            method: "POST",
+            path: "/v2/upload/complete",
+            body: { token: "complete_token returned by init" },
+            note: "Verifies the object on OSS and returns the normal v2 upload result.",
+          },
+        ],
+      },
       upload: {
         method: "PUT",
         path: "/v2/upload",
+        compatibility: "Legacy single-request upload. Still supported, but file bytes traverse Cloudflare and are subject to its request-body limit.",
         headers: {
           "X-Filename": "percent-encoded original filename (required)",
           "Content-Type": "MIME type",
@@ -373,7 +415,7 @@ function apiIndex(req, url, c) {
         (c && c.ABUSE_REPORT_EMAIL ? ` to ${c.ABUSE_REPORT_EMAIL}` : " via the configured abuse contact") +
         ". Include the public URL and the reason. Do NOT attach or re-upload the offending content.",
       report_email: (c && c.ABUSE_REPORT_EMAIL) || null,
-      terms: "https://nightcord.de5.net (see Nightcord user terms)",
+      terms: (c && c.TERMS_URL) || null,
     },
     links: {
       self_html: origin + "/",
@@ -442,12 +484,21 @@ function renderApiMarkdown(doc, origin) {
   lines.push(`|------|-----|`);
   lines.push(`| Storage (upload + legacy) | \`${doc.hosts.storage}\` |`);
   lines.push(`| R2 facade (public media) | \`${doc.hosts.r2}\` |`);
+  lines.push(`| Direct upload gateway | \`${doc.hosts.upload || "not configured"}\` |`);
   lines.push("");
   lines.push(doc.hosts.note);
   lines.push("");
   lines.push("## SEKAI v2 (prefer this)");
   lines.push("");
-  lines.push("### Upload");
+  lines.push("### Direct upload (preferred)");
+  lines.push("");
+  lines.push("1. `POST /v2/upload/init` with `{ name, type, size, kind?, w?, h? }`.");
+  lines.push("2. Create `FormData`, append every returned `upload.fields` entry, append the file last, then `POST` it to returned `upload.url`.");
+  lines.push("3. `POST /v2/upload/complete` with `{ token: complete_token }`.");
+  lines.push("");
+  lines.push("The file body goes through the dedicated upload gateway directly to OSS. It does not traverse this Worker.");
+  lines.push("");
+  lines.push("### Compatibility upload");
   lines.push("");
   lines.push("```http");
   lines.push("PUT /v2/upload");
@@ -463,7 +514,7 @@ function renderApiMarkdown(doc, origin) {
   lines.push("");
   lines.push("**Response fields:** `uuid`, `key` (=uuid), `type`, `size` (kB), `size_bytes`, `name`, `kind`, `url`, optional `w`/`h`.");
   lines.push("");
-  lines.push("**Size limits:** anonymous uploads up to **512 MiB**. Larger uploads (up to ~1GB) require a SEKAI Pass token via `Authorization: Bearer <token>` (else `401`); over ~1GB returns `413`. Cloudflare per-plan request-body limits may cap large uploads further.");
+  lines.push("**Service size limits:** anonymous uploads up to **512 MiB**. Larger uploads (up to ~1GB) require a SEKAI Pass token via `Authorization: Bearer <token>` (else `401`); over ~1GB returns `413`. Cloudflare's per-plan request-body limit additionally applies only when file bytes use this compatibility endpoint.");
   lines.push("");
   lines.push("**Example:**");
   lines.push("");
@@ -679,12 +730,25 @@ function renderApiHtml(doc, origin) {
         <strong>R2 facade (public media)</strong>
         <code>${esc(doc.hosts.r2)}</code>
       </div>
+      <div class="card-mini">
+        <strong>Direct upload gateway</strong>
+        <code>${esc(doc.hosts.upload || "not configured")}</code>
+      </div>
     </div>
     <p style="color:var(--muted);font-size:0.9rem;margin:12px 0 0">${esc(doc.hosts.note)}</p>
   </section>
 
   <section>
     <h2>SEKAI v2 — prefer this</h2>
+    <h3><span class="method put">POST</span>Direct upload</h3>
+    <ol>
+      <li><code>POST /v2/upload/init</code> with JSON <code>{ name, type, size, kind?, w?, h? }</code>.</li>
+      <li>Append all returned <code>upload.fields</code> to <code>FormData</code>, append the file last, then POST it to <code>upload.url</code>.</li>
+      <li><code>POST /v2/upload/complete</code> with JSON <code>{ token: complete_token }</code>.</li>
+    </ol>
+    <p style="color:var(--muted);font-size:0.9rem">File bytes go through the dedicated upload gateway directly to OSS, bypassing Worker request-body limits.</p>
+
+    <h3>Compatibility upload</h3>
     <h3><span class="method put">PUT</span><code>/v2/upload</code></h3>
     <table>
       <tr><th>Headers</th><td>
@@ -693,7 +757,7 @@ function renderApiHtml(doc, origin) {
         for uploads &gt; 512 MiB: <code>Authorization: Bearer &lt;sekai-pass-token&gt;</code>
       </td></tr>
       <tr><th>Body</th><td>raw file bytes</td></tr>
-      <tr><th>Limits</th><td>Anonymous &le; <strong>512 MiB</strong>. Larger (up to ~1GB) needs a SEKAI Pass token (else <code>401</code>); over ~1GB &rarr; <code>413</code>. Cloudflare per-plan request-body limits may cap large uploads further.</td></tr>
+      <tr><th>Limits</th><td>Anonymous &le; <strong>512 MiB</strong>. Larger (up to ~1GB) needs a SEKAI Pass token (else <code>401</code>); over ~1GB &rarr; <code>413</code>. Cloudflare's request-body limit also applies to this compatibility endpoint.</td></tr>
       <tr><th>Response</th><td><code>uuid</code>, <code>type</code>, <code>size</code> (kB), <code>name</code>, <code>kind</code>, <code>url</code>, optional <code>w</code>/<code>h</code></td></tr>
     </table>
     <pre>${esc(doc.sekaiv2.upload.example)}</pre>
@@ -814,7 +878,7 @@ async function persistSekaiMeta(c, meta) {
       console.warn("v2 meta upload failed: no sign/response", meta.uuid);
       return;
     }
-    if (mr.status !== 200 && mr.status !== 201) {
+    if (mr.status !== 200 && mr.status !== 201 && mr.status !== 204) {
       const errText = await mr.text().catch(() => "");
       console.warn("v2 meta upload failed:", mr.status, errText.slice(0, 200));
     }
@@ -822,6 +886,250 @@ async function persistSekaiMeta(c, meta) {
   } catch (e) {
     console.warn("v2 meta upload failed:", e);
   }
+}
+
+function scheduleSekaiMeta(c, meta, ctx) {
+  const promise = persistSekaiMeta(c, meta);
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(promise);
+  } else {
+    void promise;
+  }
+}
+
+function base64UrlEncode(data) {
+  return bufToBase64(data).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlDecode(value) {
+  const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function hmacSha256Bytes(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"],
+  );
+  return new Uint8Array(
+    await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)),
+  );
+}
+
+async function verifyHmacSha256(secret, message, signature) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+  return crypto.subtle.verify(
+    "HMAC",
+    key,
+    signature,
+    new TextEncoder().encode(message),
+  );
+}
+
+async function createUploadToken(c, payload) {
+  const encoded = base64UrlEncode(new TextEncoder().encode(JSON.stringify(payload)));
+  const signature = base64UrlEncode(await hmacSha256Bytes(c.UPLOAD_TOKEN_SECRET, encoded));
+  return `${encoded}.${signature}`;
+}
+
+async function verifyUploadToken(c, token) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  try {
+    const payloadBytes = base64UrlDecode(parts[0]);
+    const actual = base64UrlDecode(parts[1]);
+    if (base64UrlEncode(payloadBytes) !== parts[0] || base64UrlEncode(actual) !== parts[1]) {
+      return null;
+    }
+    if (!(await verifyHmacSha256(c.UPLOAD_TOKEN_SECRET, parts[0], actual))) return null;
+    const payload = JSON.parse(new TextDecoder().decode(payloadBytes));
+    if (!Number.isFinite(payload.exp) || payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function readJson(req, maxBytes = 16 * 1024) {
+  const length = Number(req.headers.get("Content-Length") || 0);
+  if (Number.isFinite(length) && length > maxBytes) return null;
+  try {
+    const text = await req.text();
+    if (!text || new TextEncoder().encode(text).byteLength > maxBytes) return null;
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function signDirectUploadPolicy(c, ossKey, fileSize, contentType, cdValue) {
+  const expiresAt = Math.floor(Date.now() / 1000) + DIRECT_UPLOAD_TTL_SECONDS;
+  const policyObj = {
+    expiration: new Date(expiresAt * 1000).toISOString(),
+    conditions: [
+      { key: ossKey },
+      ["content-length-range", fileSize, fileSize],
+      { "Content-Type": contentType },
+      { "Content-Disposition": cdValue },
+    ],
+  };
+  const policy = bufToBase64(new TextEncoder().encode(JSON.stringify(policyObj)));
+  const signature = await hmacSha1Base64(c.AKS, policy);
+  return { policy, signature, expiresAt };
+}
+
+async function headObjectSigned(c, ossKey) {
+  const date = new Date().toUTCString();
+  const resource = `/${c.BUCKET}/${ossKey}`;
+  const signature = await hmacSha1Base64(c.AKS, `HEAD\n\n\n${date}\n${resource}`);
+  const path = ossKey.split("/").map((part) => encodeURIComponent(part)).join("/");
+  return fetch(`${c.OSS_HOST}/${path}`, {
+    method: "HEAD",
+    headers: {
+      Date: date,
+      Authorization: `OSS ${c.AKID}:${signature}`,
+    },
+  });
+}
+
+function sekaiPublicPath(kind, uuid) {
+  return `/${kind === "sticker" ? "stickers" : kind === "image" ? "images" : "files"}/${uuid}`;
+}
+
+async function initSekaiV2Upload(req, c, env) {
+  if (!(c.AKS && c.PUBLIC_UPLOAD_HOST && c.UPLOAD_TOKEN_SECRET)) {
+    return fail(501, "Direct upload is not configured");
+  }
+  const input = await readJson(req);
+  if (!input || typeof input !== "object") return fail(400, "Invalid JSON body");
+
+  const rawName = String(input.name || "").trim();
+  const contentType = String(input.type || "application/octet-stream").trim();
+  const fileSize = Number(input.size);
+  if (!rawName || rawName.length > 512 || /\.\.|\/\/|[\x00-\x1f]/.test(rawName)) {
+    return fail(400, "Invalid file name");
+  }
+  if (!contentType || contentType.length > 255 || /[\r\n]/.test(contentType)) {
+    return fail(400, "Invalid content type");
+  }
+  const sizeErr = await authorizeUploadSize(req, env, fileSize);
+  if (sizeErr) return sizeErr;
+
+  const uuid = crypto.randomUUID();
+  const kind = inferKind(contentType, input.kind);
+  const ext = extOf(rawName);
+  const ossKey = `${c.PREFIX}/sekai/${uuid}${ext}`;
+  const display = sanitize(rawName);
+  const cdValue = buildContentDisposition(display);
+  const direct = await signDirectUploadPolicy(c, ossKey, fileSize, contentType, cdValue);
+
+  let w = Number(input.w);
+  let h = Number(input.h);
+  if (!Number.isInteger(w) || w <= 0) w = undefined;
+  if (!Number.isInteger(h) || h <= 0) h = undefined;
+  const tokenPayload = {
+    v: 1,
+    exp: direct.expiresAt + 15 * 60,
+    uuid,
+    kind,
+    type: contentType,
+    name: rawName,
+    size: fileSize,
+    ext,
+    ossKey,
+    ...(w ? { w } : {}),
+    ...(h ? { h } : {}),
+  };
+
+  return ok({
+    uuid,
+    key: uuid,
+    url: sekaiPublicPath(kind, uuid),
+    upload: {
+      url: `${c.PUBLIC_UPLOAD_HOST}/`,
+      method: "POST",
+      expires_at: new Date(direct.expiresAt * 1000).toISOString(),
+      fields: {
+        key: ossKey,
+        policy: direct.policy,
+        Signature: direct.signature,
+        OSSAccessKeyId: c.AKID,
+        success_action_status: "204",
+        "Content-Type": contentType,
+        "Content-Disposition": cdValue,
+      },
+    },
+    complete_token: await createUploadToken(c, tokenPayload),
+  }, { "Cache-Control": "no-store" });
+}
+
+async function completeSekaiV2Upload(req, c, ctx) {
+  if (!(c.AKS && c.UPLOAD_TOKEN_SECRET)) return fail(501, "Direct upload is not configured");
+  const input = await readJson(req);
+  const payload = input && await verifyUploadToken(c, input.token);
+  if (!payload || payload.v !== 1 || !UUID_RE.test(payload.uuid)) {
+    return fail(400, "Invalid or expired upload token");
+  }
+  if (payload.ossKey !== `${c.PREFIX}/sekai/${payload.uuid}${payload.ext || ""}`) {
+    return fail(400, "Invalid upload token");
+  }
+
+  const head = await headObjectSigned(c, payload.ossKey);
+  if (head.status === 404) {
+    await drain(head);
+    return fail(409, "Upload is not present in object storage");
+  }
+  if (!head.ok) {
+    await drain(head);
+    return fail(502, "Could not verify uploaded object");
+  }
+  const storedSize = Number(head.headers.get("Content-Length"));
+  const storedType = head.headers.get("Content-Type") || "";
+  await drain(head);
+  if (storedSize !== payload.size) return fail(409, "Uploaded object size does not match");
+  if (storedType && storedType !== payload.type) return fail(409, "Uploaded object type does not match");
+
+  const sizeKb = Math.round((payload.size / 1024) * 10) / 10;
+  const meta = {
+    uuid: payload.uuid,
+    kind: payload.kind,
+    type: payload.type,
+    name: payload.name,
+    size_bytes: payload.size,
+    size: sizeKb,
+    ext: payload.ext || "",
+    ossKey: payload.ossKey,
+    created: new Date().toISOString(),
+    ...(payload.w ? { w: payload.w } : {}),
+    ...(payload.h ? { h: payload.h } : {}),
+  };
+  scheduleSekaiMeta(c, meta, ctx);
+
+  return ok({
+    uuid: payload.uuid,
+    key: payload.uuid,
+    type: payload.type,
+    size: sizeKb,
+    size_bytes: payload.size,
+    name: payload.name,
+    kind: payload.kind,
+    url: sekaiPublicPath(payload.kind, payload.uuid),
+    ...(payload.w ? { w: payload.w } : {}),
+    ...(payload.h ? { h: payload.h } : {}),
+  }, { "Cache-Control": "no-store" });
 }
 
 /**
@@ -864,7 +1172,7 @@ async function putSekaiV2(req, c, ctx, env) {
     bodySize: fileSize,
   });
   if (!r) return fail(502);
-  if (r.status !== 200 && r.status !== 201) {
+  if (r.status !== 200 && r.status !== 201 && r.status !== 204) {
     const errText = await r.text().catch(() => "");
     console.error("OSS error (v2):", r.status, errText.slice(0, 800));
     await drain(r);
@@ -895,11 +1203,7 @@ async function putSekaiV2(req, c, ctx, env) {
   if (w) meta.w = w;
   if (h) meta.h = h;
 
-  if (ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(persistSekaiMeta(c, meta));
-  } else {
-    persistSekaiMeta(c, meta).catch(() => {});
-  }
+  scheduleSekaiMeta(c, meta, ctx);
 
   const publicPath = `/${kind === "sticker" ? "stickers" : kind === "image" ? "images" : "files"}/${uuid}`;
 
@@ -1038,7 +1342,7 @@ async function putSafe(req, c, env) {
     bodySize: fileSize,
   });
   if (!r) return fail(502);
-  if (r.status !== 200 && r.status !== 201) {
+  if (r.status !== 200 && r.status !== 201 && r.status !== 204) {
     const errText = await r.text().catch(() => "");
     console.error("OSS error:", r.status, errText);
     await drain(r);
@@ -1080,7 +1384,7 @@ async function put(req, c, env) {
     bodySize: fileSize,
   });
   if (!r) return fail(502);
-  if (r.status !== 200 && r.status !== 201) {
+  if (r.status !== 200 && r.status !== 201 && r.status !== 204) {
     await drain(r);
     return fail(502);
   }
@@ -1142,7 +1446,7 @@ async function putChunk(req, c, env) {
     bodySize: chunkSize,
   });
   if (!r) return fail(502);
-  if (r.status !== 200 && r.status !== 201) {
+  if (r.status !== 200 && r.status !== 201 && r.status !== 204) {
     await drain(r);
     return fail(502);
   }
@@ -1170,7 +1474,7 @@ async function putChunk(req, c, env) {
       body: metaBytes,
       bodySize: metaBytes.byteLength,
     });
-    if (mr && (mr.status === 200 || mr.status === 201)) metaUploaded = true;
+    if (mr && (mr.status === 200 || mr.status === 201 || mr.status === 204)) metaUploaded = true;
     if (mr) await drain(mr);
   }
 
@@ -1338,7 +1642,7 @@ async function postToOSSOnce(uploadHost, c, ossKey, policy, sig, contentType, di
     { n: "policy", v: policy },
     { n: "Signature", v: sig },
     { n: "OSSAccessKeyId", v: c.AKID },
-    { n: "success_action_status", v: "201" },
+    { n: "success_action_status", v: "204" },
     { n: "Content-Disposition", v: cdValue },
   ];
 
@@ -1409,7 +1713,7 @@ async function postToOSS(c, ossKey, policy, sig, contentType, displayName, cdVal
     bodySize,
   );
 
-  if ((r.status === 200 || r.status === 201) || primary === regional) {
+  if ((r.status === 200 || r.status === 201 || r.status === 204) || primary === regional) {
     return r;
   }
 
@@ -1458,7 +1762,7 @@ async function uploadObject(c, opts) {
   if (preferPut) {
     try {
       const r = await putObjectOSS(c, ossKey, contentType, body, bodySize);
-      if (r.status === 200 || r.status === 201) return r;
+      if (r.status === 200 || r.status === 201 || r.status === 204) return r;
 
       const errText = await r.text().catch(() => "");
       console.warn("PutObject failed:", r.status, errText.slice(0, 240));
@@ -1858,12 +2162,13 @@ async function drain(r) {
   }
 }
 
-function ok(data) {
+function ok(data, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     headers: {
       "Content-Type": "application/json;charset=utf-8",
       "Access-Control-Allow-Origin": "*",
       "X-Content-Type-Options": "nosniff",
+      ...extraHeaders,
     },
   });
 }

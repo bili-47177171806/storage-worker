@@ -1,13 +1,14 @@
 # storage-worker
 
-Cloudflare Worker that fronts **Aliyun OSS** (or any S3-compatible PostObject-style flow with a small signing API): legacy path-style upload/download **plus** a SEKAI-oriented v2 façade (`/v2/upload`, `/images|files|stickers/{uuid}`).
+Cloudflare Worker that fronts **Aliyun OSS**: a browser-to-storage direct-upload flow, legacy path-style upload/download, and a SEKAI-oriented v2 façade (`/v2/upload`, `/images|files|stickers/{uuid}`).
 
 No bucket names, private endpoints, or AccessKey material are hardcoded in `worker.js`. Configure everything via Wrangler vars + secrets.
 
 ## Features
 
 - **Legacy** `PUT /`, chunked upload, safe-path upload, `GET|HEAD|DELETE /{key}`
-- **SEKAI v2** `PUT /v2/upload` → UUID + typed resolve URLs
+- **SEKAI v2 direct upload**: Worker signs, a dedicated upload gateway carries the file body to OSS, Worker confirms
+- Compatible **SEKAI v2** `PUT /v2/upload` → UUID + typed resolve URLs
 - Streaming PostObject (avoids buffering whole files in the isolate)
 - Optional **upload host** (CDN / custom domain) separate from regional GET origin
 - v2 object **meta** written in the background (`waitUntil`) so upload latency stays close to legacy
@@ -17,15 +18,15 @@ No bucket names, private endpoints, or AccessKey material are hardcoded in `work
 
 ```bash
 # 1. Config (gitignored)
-cp wrangler.toml.example wrangler.toml.local
-# edit wrangler.toml.local — your bucket, endpoint, signing backend, optional CDN host
+cp wrangler.toml.example wrangler.local.toml
+# edit wrangler.local.toml — your bucket, endpoint, signing backend, optional CDN host
 
 # 2. AccessKey Id + Secret (Cloudflare secrets — never commit)
-npx wrangler secret put OSS_AKID -c wrangler.toml.local
-npx wrangler secret put OSS_AKS  -c wrangler.toml.local
+npx wrangler secret put OSS_AKID -c wrangler.local.toml
+npx wrangler secret put OSS_AKS  -c wrangler.local.toml
 
 # 3. Deploy
-npx wrangler deploy -c wrangler.toml.local
+npx wrangler deploy -c wrangler.local.toml
 ```
 
 Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
@@ -40,10 +41,13 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 | `OSS_AKS` | recommended | **secret** | AccessKey **Secret** (local HMAC / PutObject) |
 | `OSS_PREFIX` | no | `[vars]` | Object key prefix (default `AttachFiles`) |
 | `OSS_UPLOAD_HOST` | no | `[vars]` | Upload origin; empty → regional host |
+| `PUBLIC_UPLOAD_HOST` | direct upload | `[vars]` | Public upload gateway, for example `https://upload.example.com` |
+| `UPLOAD_TOKEN_SECRET` | no | **secret** | Separate HMAC secret for completion tokens; falls back to `OSS_AKS` |
 | `OSS_PUT_MODE` | no | `[vars]` | `auto` (default) / `put` / `post` |
 | `SIGN_BACKEND` | no* | `[vars]` | Remote policy API if `OSS_AKS` unset |
 | `PUBLIC_STORAGE_HOST` | no | `[vars]` | Docs only |
 | `PUBLIC_R2_HOST` | no | `[vars]` | Docs only |
+| `TERMS_URL` | no | `[vars]` | Public terms URL shown in API docs |
 | `ABUSE_REPORT_EMAIL` | no | `[vars]` | Abuse contact shown in API docs / README |
 | `AUTH_DB` | no** | `[[d1_databases]]` | SEKAI Pass D1 (`sekai_pass_db`); needed only for uploads > 512 MiB |
 
@@ -71,6 +75,39 @@ GET {SIGN_BACKEND}/File/GetOssPolicy2Signature?userid={id}&bucket={bucket}
 
 ### SEKAI v2
 
+New clients should use the three-step direct-upload flow. Only the small init and complete
+JSON requests traverse the Worker; the file body goes through the dedicated upload gateway
+directly to OSS.
+
+```http
+POST /v2/upload/init
+Content-Type: application/json
+
+{"name":"photo.jpg","type":"image/jpeg","size":209408,"kind":"image"}
+```
+
+The response contains `upload.url`, `upload.fields`, and `complete_token`. Append every
+field to `FormData`, append the file **last**, then POST the form to `upload.url`:
+
+```js
+const form = new FormData();
+for (const [name, value] of Object.entries(init.upload.fields)) form.append(name, value);
+form.append("file", file, file.name);
+const uploaded = await fetch(init.upload.url, { method: "POST", body: form });
+if (!uploaded.ok) throw new Error(`OSS upload failed: ${uploaded.status}`);
+```
+
+Finally confirm against OSS and receive the normal v2 response:
+
+```http
+POST /v2/upload/complete
+Content-Type: application/json
+
+{"token":"<complete_token>"}
+```
+
+`PUT /v2/upload` remains supported for existing clients:
+
 ```http
 PUT /v2/upload
 X-Filename: photo.jpg
@@ -88,7 +125,7 @@ Authorization: Bearer <sekai-pass-token>   # required only when Content-Length >
 | 512 MiB – ~1GB | Valid **SEKAI Pass** access token (`Authorization: Bearer …`); missing/invalid → `401` |
 | > ~1GB | Rejected → `413` |
 
-> Cloudflare enforces a per-plan request-body limit (Free/Pro 100MB, Business 200MB, Enterprise 500MB by default). Uploads above that plan limit need an account-level increase regardless of this Worker's tiers.
+> The hosting platform's request-body limit applies when file bytes use the compatible `PUT /v2/upload` endpoint. It does not apply to the direct-upload body because that request does not traverse the Worker.
 
 ```json
 {
@@ -136,9 +173,11 @@ terms for the governing policy.
 
 ## Security notes
 
-- Do **not** commit `wrangler.toml.local` or real `wrangler.toml` with production values.
+- Do **not** commit `wrangler.local.toml` or real `wrangler.toml` with production values.
 - Rotate any AccessKey that was ever pasted into chat, logs, or old commits.
 - Public `GET /v2/meta/{uuid}` does not return internal object keys.
+- Direct-upload forms are restricted to one exact object key, size, MIME type, and content disposition, and expire after two hours.
+- Set `UPLOAD_TOKEN_SECRET` separately if you want completion-token rotation independent of the OSS AccessKey secret.
 - Uploads over 512 MiB require a SEKAI Pass token (`AUTH_DB` binding); anonymous uploads never touch it.
 - Report vulnerabilities privately — see [SECURITY.md](./SECURITY.md).
 
