@@ -1,17 +1,17 @@
 # storage-worker
 
-Cloudflare Worker that fronts **Aliyun OSS**: a browser-to-storage direct-upload flow, legacy path-style upload/download, and a SEKAI-oriented v2 façade (`/v2/upload`, `/images|files|stickers/{uuid}`).
+Cloudflare Worker that fronts **Aliyun OSS** for upload/API work: `storage.*` signs and confirms uploads, `upload.*` carries direct file bodies to OSS, and `r2.*` serves public media by directly reverse-proxying OSS objects.
 
 No bucket names, private endpoints, or AccessKey material are hardcoded in `worker.js`. Configure everything via Wrangler vars + secrets.
 
 ## Features
 
-- **Legacy** `PUT /`, chunked upload, safe-path upload, `GET|HEAD|DELETE /{key}`
 - **SEKAI v2 direct upload**: Worker signs, a dedicated upload gateway carries the file body to OSS, Worker confirms
-- Compatible **SEKAI v2** `PUT /v2/upload` → UUID + typed resolve URLs
+- **Multipart direct upload** for authenticated large-file clients
+- Exact-key gallery manifest upload through `POST /v2/upload/gallery/init`
 - Streaming PostObject (avoids buffering whole files in the isolate)
-- Optional **upload host** (CDN / custom domain) separate from regional GET origin
-- v2 object **meta** written in the background (`waitUntil`) so upload latency stays close to legacy
+- Hard host separation: `storage.*` API only, `upload.*` signed upload bodies only, `r2.*` downloads only
+- v2 object **meta** stored on OSS object metadata (`x-oss-meta-sekai-*`)
 - Root **API docs** as HTML / JSON / Markdown (`Accept` / `?format=`)
 
 ## Quick start
@@ -45,20 +45,18 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 | `OSS_UPLOAD_HOST` | no | `[vars]` | Upload origin; empty → regional host |
 | `PUBLIC_UPLOAD_HOST` | direct upload | `[vars]` | Public upload gateway, for example `https://upload.example.com` |
 | `UPLOAD_TOKEN_SECRET` | no | **secret** | Separate HMAC secret for completion tokens; falls back to `OSS_AKS` |
-| `DIRECT_UPLOAD_OBJECT_METADATA` | no | `[vars]` | Object Metadata is enabled by default; set to `0` to use legacy JSON sidecars |
 | `MULTIPART_REQUIRE_AUTH` | no | `[vars]` | `1` by default; requires SEKAI Pass for every Multipart initialization |
 | `MULTIPART_STS_ENABLED` | no | `[vars]` | Set to `1` to issue short-lived, single-object STS credentials to Multipart clients |
 | `MULTIPART_RECOMMENDED_CONCURRENCY` | no | `[vars]` | Client recommendation, default `2`; higher concurrency did not improve the measured upload-gateway throughput |
 | `STS_ENDPOINT` | with STS | `[vars]` | STS RPC endpoint, for example `sts.cn-qingdao.aliyuncs.com` |
 | `STS_ROLE_ARN` | with STS | `[vars]` | RAM role assumed for short-lived Multipart credentials |
 | `STS_AKID` / `STS_AKS` | with STS | **secret** | Parent RAM credentials used only to call `AssumeRole`; never returned to clients |
-| `WORKER_UPLOAD_MAX_BYTES` | no | `[vars]` | Body limit advertised/enforced by Worker upload endpoints; default keeps the legacy ~1 GB ceiling, but must not exceed the Cloudflare plan limit |
 | `DIRECT_UPLOAD_MAX_BYTES` | no | `[vars]` | Single signed upload limit; defaults to and cannot exceed the upload gateway's 800 MiB ceiling |
 | `MULTIPART_MAX_PART_BYTES` | no | `[vars]` | Multipart part ceiling; defaults to and cannot exceed 800 MiB (the tighter of OSS 5 GiB and the upload gateway) |
 | `OSS_PUT_MODE` | no | `[vars]` | `auto` (default) / `put` / `post` |
 | `SIGN_BACKEND` | no* | `[vars]` | Remote policy API if `OSS_AKS` unset |
 | `PUBLIC_STORAGE_HOST` | no | `[vars]` | Docs only |
-| `PUBLIC_R2_HOST` | no | `[vars]` | Docs only |
+| `PUBLIC_R2_HOST` | public media | `[vars]` | Public media host that directly reverse-proxies OSS |
 | `TERMS_URL` | no | `[vars]` | Public terms URL shown in API docs |
 | `ABUSE_REPORT_EMAIL` | no | `[vars]` | Abuse contact shown in API docs / README |
 | `AUTH_DB` | no** | `[[d1_databases]]` | SEKAI Pass D1 (`sekai_pass_db`); required for Multipart and uploads > 512 MiB |
@@ -68,11 +66,7 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 
 **Preferred:** set `OSS_AKS` so the Worker signs PostObject policy (or PutObject) locally — no external signer RTT.
 
-Set `WORKER_UPLOAD_MAX_BYTES` to the actual Cloudflare request-body limit for the zone/account.
-Cloudflare may reject an oversized request before the Worker runs. The signed single-upload path
-uses the dedicated upload gateway instead and is capped at 800 MiB.
-
-**Legacy fallback:** without SK,
+Without `OSS_AKS`, the Worker can still use the remote signing fallback:
 
 ```http
 GET {SIGN_BACKEND}/File/GetOssPolicy2Signature?userid={id}&bucket={bucket}
@@ -124,6 +118,17 @@ Content-Type: application/json
 
 {"token":"<complete_token>"}
 ```
+
+The gallery manifest uses the same host split with an exact fixed key:
+
+```http
+POST /v2/upload/gallery/init
+Content-Type: application/json
+
+{"size":4096}
+```
+
+Append the returned fields and `manifest.json` to `FormData`, then POST it to `upload.url`.
 
 ### Multipart direct upload
 
@@ -199,27 +204,6 @@ OSS permits 100 KiB-5 GiB non-final parts, at most 10,000 parts, and an object o
 48.8 TiB. The upload gateway is tighter at 800 MiB per request, so this deployment permits
 at most 800 MiB per part and 8,388,608,000,000 bytes (about 7.63 TiB) per completed object.
 
-`PUT /v2/upload` remains supported for existing clients:
-
-```http
-PUT /v2/upload
-X-Filename: photo.jpg
-Content-Type: image/jpeg
-Content-Length: …
-X-Sekai-Kind: image   # optional
-Authorization: Bearer <sekai-pass-token>   # required only when Content-Length > 512 MiB
-```
-
-**Upload size tiers:**
-
-| Size | Requirement |
-|------|-------------|
-| ≤ 512 MiB | Anonymous (aligned with Cloudflare's cacheable object limit) |
-| 512 MiB – ~1GB | Valid **SEKAI Pass** access token (`Authorization: Bearer …`); missing/invalid → `401` |
-| > ~1GB | Rejected → `413` |
-
-> The hosting platform's request-body limit applies when file bytes use the compatible `PUT /v2/upload` endpoint. It does not apply to the direct-upload body because that request does not traverse the Worker.
-
 ```json
 {
   "uuid": "…",
@@ -234,30 +218,18 @@ Authorization: Bearer <sekai-pass-token>   # required only when Content-Length >
 ```
 
 ```http
-GET|HEAD /images/{uuid}
-GET|HEAD /files/{uuid}
-GET|HEAD /stickers/{uuid}
+GET|HEAD {PUBLIC_R2_HOST}/images/{uuid}
+GET|HEAD {PUBLIC_R2_HOST}/files/{uuid}
+GET|HEAD {PUBLIC_R2_HOST}/stickers/{uuid}
 GET /v2/meta/{uuid}
 ```
 
-Object layout (typical): `{PREFIX}/sekai/{uuid}{ext}` plus best-effort `{PREFIX}/sekai/{uuid}.json` (internal; public meta omits storage keys).
-
-### Legacy
-
-| Method | Path | Notes |
-|--------|------|--------|
-| PUT | `/` | Single object |
-| PUT | `/` + chunk headers | Chunked |
-| PUT | `/` + `X-Safe-Path` | Restricted prefixes |
-| GET/HEAD/DELETE | `/{key}` | Proxy |
-| * | `/chunked/…` | Chunked download/delete |
+Object layout: `{PREFIX}/sekai/{uuid}` with required `x-oss-meta-sekai-*` object metadata. `storage.*` rejects object downloads and retired PUT routes; public media must use `PUBLIC_R2_HOST`.
 
 ## Content policy & abuse
 
-This is an **anonymous file service**. Arbitrary file types are allowed (including
-executables) — that is intentional, not an oversight. Stored objects are always served
-as downloads (`Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`), never
-rendered in the browser.
+Uploads may contain arbitrary file types, including executables. Public objects are served only
+through `r2.*` with `X-Content-Type-Options: nosniff`; `storage.*` never returns object bytes.
 
 Illegal content is prohibited and removed on report. To report abuse, email the address in
 `ABUSE_REPORT_EMAIL` (also shown in the root API docs) with the **public URL** and the

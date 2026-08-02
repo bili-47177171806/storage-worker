@@ -139,7 +139,7 @@ describe('PostObject policy 用 Worker body 端点限制', () => {
   });
 });
 
-describe('worker.fetch —— 大文件上传鉴权（返回在触达 OSS 之前）', () => {
+describe('worker.fetch —— retired body upload', () => {
   const ENV = {
     OSS_BUCKET: 'b',
     OSS_ENDPOINT: 'oss.example',
@@ -162,26 +162,14 @@ describe('worker.fetch —— 大文件上传鉴权（返回在触达 OSS 之前
     });
   }
 
-  test('超过绝对硬顶 → 413', async () => {
+  test('PUT /v2/upload is retired regardless of body size or authorization', async () => {
     const res = await worker.fetch(putReq(MAX_UPLOAD_BYTES + 1), ENV, ctx);
-    assert.equal(res.status, 413);
-  });
-
-  test('(ANON, MAX] 无 Authorization → 401 + WWW-Authenticate', async () => {
-    const res = await worker.fetch(putReq(ANON_MAX_UPLOAD_BYTES + 1), ENV, ctx);
-    assert.equal(res.status, 401);
-    assert.equal(res.headers.get('WWW-Authenticate'), 'Bearer');
-    assert.ok(
-      (res.headers.get('Access-Control-Expose-Headers') || '').includes('WWW-Authenticate'),
-    );
-  });
-
-  test('(ANON, MAX] 带 Bearer 但无 AUTH_DB 绑定 → 仍 401（authenticate 返回 null）', async () => {
-    const res = await worker.fetch(
+    assert.equal(res.status, 410);
+    const authorized = await worker.fetch(
       putReq(ANON_MAX_UPLOAD_BYTES + 1, { Authorization: 'Bearer sometoken' }),
       ENV,
       ctx,
     );
-    assert.equal(res.status, 401);
+    assert.equal(authorized.status, 410);
   });
 });

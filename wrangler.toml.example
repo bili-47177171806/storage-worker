@@ -18,8 +18,7 @@ OSS_ENDPOINT = "oss-cn-hangzhou.aliyuncs.com"
 OSS_PREFIX = "AttachFiles"
 OSS_UPLOAD_HOST = ""
 PUBLIC_UPLOAD_HOST = "https://upload.example.com"
-# Direct uploads store metadata on the object by default. Set to "0" for legacy JSON sidecars.
-# DIRECT_UPLOAD_OBJECT_METADATA = "0"
+# v2 uploads always store metadata on the OSS object (`x-oss-meta-sekai-*`).
 # Multipart initialization requires SEKAI Pass. Set to "0" only for isolated testing.
 MULTIPART_REQUIRE_AUTH = "1"
 # Per-object STS lets clients sign their own OSS multipart requests. Keep parent keys in Wrangler secrets.
@@ -27,8 +26,6 @@ MULTIPART_STS_ENABLED = "1"
 MULTIPART_RECOMMENDED_CONCURRENCY = "2"
 STS_ENDPOINT = "sts.cn-hangzhou.aliyuncs.com"
 STS_ROLE_ARN = "acs:ram::<account-id>:role/<oss-multipart-role>"
-# Match this to the Cloudflare plan's request-body limit for PUT /v2/upload and legacy PUT paths.
-# WORKER_UPLOAD_MAX_BYTES = "1048576000"
 # Dedicated upload gateway limits. Values above 800 MiB are clamped.
 # DIRECT_UPLOAD_MAX_BYTES = "838860800"
 # MULTIPART_MAX_PART_BYTES = "838860800"
@@ -39,6 +36,8 @@ OSS_PUT_MODE = "auto"
 # SIGN_BACKEND = "https://sign.example.com"  # only if OSS_AKS unset
 PUBLIC_STORAGE_HOST = "https://storage.example.com"
 PUBLIC_R2_HOST = "https://media.example.com"
+# Bind storage, upload, and media hostnames to this Worker when it owns all three roles.
+# Runtime routing enforces API-only, signed-upload-only, and download-only behavior respectively.
 TERMS_URL = "https://example.com/terms"
 # Abuse reports mailbox (shown in API docs / README). Leave unset until you have one.
 # ABUSE_REPORT_EMAIL = "abuse@example.com"

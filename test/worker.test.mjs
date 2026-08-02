@@ -353,8 +353,11 @@ describe('常量', () => {
 
   test('CORS 允许上传所需的自定义头（含 Authorization）', () => {
     const allowed = CORS_HEADERS['Access-Control-Allow-Headers'];
-    for (const h of ['Authorization', 'X-Filename', 'X-Chunk-Index', 'X-Chunk-Total', 'X-Sekai-Kind']) {
+    for (const h of ['Authorization', 'Content-Type']) {
       assert.ok(allowed.includes(h), h);
+    }
+    for (const retired of ['X-Filename', 'X-Chunk-Index', 'X-Sekai-Kind']) {
+      assert.ok(!allowed.includes(retired), retired);
     }
   });
 

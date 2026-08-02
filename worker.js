@@ -1,15 +1,15 @@
 /**
  * Nightcord Storage Worker — object-storage proxy (OSS)
  *
- * Legacy API (unchanged paths):
- *   PUT /                    single / chunked / safe-path upload
- *   GET|HEAD|DELETE /{key}   object proxy
- *   GET|HEAD|DELETE /chunked/...
- *
- * SEKAI v2 facade (additive):
- *   PUT /v2/upload
+ * Active upload API:
  *   POST /v2/upload/init | /v2/upload/complete
- *   GET|HEAD /images/{uuid} | /files/{uuid} | /stickers/{uuid}
+ *   POST /v2/upload/multipart/*
+ *   POST /v2/upload/gallery/init
+ *
+ * Storage-host object downloads and retired upload routes are disabled.
+ * Public media is served only by the configured R2 host.
+ *
+ * Metadata API:
  *   GET /v2/meta/{uuid}
  *
  * All environment-specific values come from Worker bindings / secrets
@@ -46,40 +46,31 @@ const MULTIPART_RECOMMENDED_CONCURRENCY = 2;
 const MULTIPART_SIGN_BATCH_MAX = 20;
 const MULTIPART_PART_URL_TTL_SECONDS = 15 * 60;
 const STS_DEFAULT_DURATION_SECONDS = 3600;
-/** Extensions probed when v2 meta sidecar is missing (common first). */
-const SEKAI_PROBE_EXTS = [
-  "",
-  ".png",
-  ".jpg",
-  ".jpeg",
-  ".webp",
-  ".gif",
-  ".bin",
-  ".mp3",
-  ".flac",
-  ".ogg",
-  ".wav",
-  ".pdf",
-  ".zip",
-  ".mp4",
-  ".webm",
-];
-
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers":
-    "Authorization, Content-Type, X-Filename, X-Chunk-Index, X-Chunk-Total, " +
-    "X-File-ID, X-Original-Filename, X-File-Size, X-Safe-Path, " +
-    "X-Sekai-Kind, X-Image-Width, X-Image-Height",
+  "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type",
   "Access-Control-Expose-Headers": "WWW-Authenticate",
   "Access-Control-Max-Age": "86400",
 };
-
+const UPLOAD_CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, PUT, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Expose-Headers": "ETag",
+  "Access-Control-Max-Age": "86400",
+};
 const PASS_HEADERS = [
   "Content-Type", "Content-Length", "Content-Range",
   "Accept-Ranges", "Content-Disposition", "ETag", "Last-Modified",
 ];
+const R2_CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+  "Access-Control-Allow-Headers": "Range, If-None-Match, If-Modified-Since",
+  "Access-Control-Expose-Headers": PASS_HEADERS.join(", "),
+  "Access-Control-Max-Age": "86400",
+};
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -160,8 +151,6 @@ function cfg(env) {
     PUBLIC_R2_HOST: String(e.PUBLIC_R2_HOST || "").trim().replace(/\/$/, ""),
     ABUSE_REPORT_EMAIL: String(e.ABUSE_REPORT_EMAIL || "").trim(),
     TERMS_URL: String(e.TERMS_URL || "").trim(),
-    DIRECT_UPLOAD_OBJECT_METADATA:
-      String(e.DIRECT_UPLOAD_OBJECT_METADATA ?? "1").trim() !== "0",
     MULTIPART_REQUIRE_AUTH:
       String(e.MULTIPART_REQUIRE_AUTH ?? "1").trim() !== "0",
     MULTIPART_STS_ENABLED: String(e.MULTIPART_STS_ENABLED || "").trim() === "1",
@@ -217,27 +206,117 @@ function getSafeId(path) {
   return seg && SAFE_USERIDS.has(seg) ? seg : null;
 }
 
+function roleConfigOk(c, role) {
+  if (role === "storage") return configOk(c);
+  return !!(c.BUCKET && c.ENDPOINT && c.OSS_HOST);
+}
+
+function configuredHostname(value) {
+  try {
+    return value ? new URL(value).hostname.toLowerCase() : "";
+  } catch {
+    return "";
+  }
+}
+
+function requestRole(url, c) {
+  const hostname = url.hostname.toLowerCase();
+  if (hostname === configuredHostname(c.PUBLIC_UPLOAD_HOST)) return "upload";
+  if (hostname === configuredHostname(c.PUBLIC_R2_HOST)) return "r2";
+  return "storage";
+}
+
+function retiredUpload() {
+  return fail(
+    410,
+    "Upload endpoint retired; use POST /v2/upload/init and POST /v2/upload/complete",
+  );
+}
+
+function downloadsDisabled(c) {
+  const suffix = c.PUBLIC_R2_HOST ? `; use ${c.PUBLIC_R2_HOST}` : "";
+  return fail(410, `Storage downloads are disabled${suffix}`);
+}
+
+function preflightHeaders(role) {
+  if (role === "upload") return UPLOAD_CORS_HEADERS;
+  if (role === "r2") return R2_CORS_HEADERS;
+  return CORS_HEADERS;
+}
+
+async function proxyUploadRequest(req, url, c) {
+  const path = url.pathname.slice(1);
+  const isDirectForm = req.method === "POST" && !path && !url.search;
+  const isSignedMultipart =
+    (req.method === "PUT" || req.method === "POST") &&
+    !!path &&
+    url.searchParams.has("uploadId") &&
+    url.searchParams.has("OSSAccessKeyId") &&
+    url.searchParams.has("Expires") &&
+    url.searchParams.has("Signature");
+  if (!(isDirectForm || isSignedMultipart)) {
+    return fail(405, "Upload host accepts only signed upload requests");
+  }
+
+  const target = new URL(c.OSS_HOST);
+  target.pathname = url.pathname;
+  target.search = url.search;
+  const requestHeaders = new Headers(req.headers);
+  requestHeaders.delete("Host");
+  const upstream = await fetch(target, {
+    method: req.method,
+    headers: requestHeaders,
+    body: req.body,
+    redirect: "manual",
+  });
+  const headers = new Headers(upstream.headers);
+  for (const [name, value] of Object.entries(UPLOAD_CORS_HEADERS)) {
+    if (!headers.has(name)) headers.set(name, value);
+  }
+  return new Response(upstream.body, { status: upstream.status, headers });
+}
+
+async function serveR2Request(req, ctx, url, c) {
+  if (req.method !== "GET" && req.method !== "HEAD") return fail(405);
+  const path = url.pathname.slice(1);
+  if (!path || path.length > 1024 || /\.\.|\/\/|[\x00-\x1f]/.test(path)) {
+    return fail(400);
+  }
+
+  const typed = path.match(/^(images|files|stickers)\/([^/]+)\/?$/);
+  if (typed) {
+    if (!UUID_RE.test(typed[2])) return fail(400);
+    return get(req, ctx, url, c, `${c.PREFIX}/sekai/${typed[2]}`);
+  }
+  if (path.startsWith("chunked/")) return fail(410, "Chunked downloads are retired");
+  return get(req, ctx, url, c, `${c.PREFIX}/${path}`);
+}
+
 /* ═══════════════════════════════════════════════════════
  *  Entry
  * ═══════════════════════════════════════════════════════ */
 export default {
   async fetch(req, env, ctx) {
+    const c = cfg(env);
+    const url = new URL(req.url);
+    const role = requestRole(url, c);
     if (req.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return new Response(null, { status: 204, headers: preflightHeaders(role) });
     }
 
-    const c = cfg(env);
-    if (!configOk(c)) {
+    if (!roleConfigOk(c, role)) {
       console.error(
         "missing bindings: need OSS_BUCKET, OSS_ENDPOINT, OSS_AKID, and OSS_AKS (or SIGN_BACKEND)",
       );
       return fail(500, "Storage worker misconfigured");
     }
 
-    const url = new URL(req.url);
     const path = url.pathname.slice(1);
 
     try {
+      if (role === "upload") return await proxyUploadRequest(req, url, c);
+      if (role === "r2") return await serveR2Request(req, ctx, url, c);
+
       // ── Index / API docs (GET|HEAD /) ──
       if (!path && (req.method === "GET" || req.method === "HEAD")) {
         return apiIndex(req, url, c);
@@ -248,14 +327,14 @@ export default {
       }
 
       // ── SEKAI v2 routes (path-based; works on any bound host) ──
-      if (path === "v2/upload" && req.method === "PUT") {
-        return await putSekaiV2(req, c, ctx, env);
-      }
       if (path === "v2/upload/init" && req.method === "POST") {
         return await initSekaiV2Upload(req, c, env);
       }
       if (path === "v2/upload/complete" && req.method === "POST") {
         return await completeSekaiV2Upload(req, c, ctx);
+      }
+      if (path === "v2/upload/gallery/init" && req.method === "POST") {
+        return await initGalleryManifestUpload(req, c);
       }
       if (path === "v2/upload/multipart/init" && req.method === "POST") {
         return await initSekaiV2MultipartUpload(req, c, env);
@@ -276,43 +355,18 @@ export default {
         const uuid = path.slice("v2/meta/".length).split("/")[0];
         return await getSekaiMeta(req, c, uuid);
       }
-      {
-        const m = path.match(/^(images|files|stickers)\/([^/]+)\/?$/);
-        if (m && (req.method === "GET" || req.method === "HEAD")) {
-          return await getSekaiObject(req, ctx, url, c, m[1], m[2]);
-        }
+      if (req.method === "PUT") {
+        return retiredUpload();
       }
 
-      // ── Legacy ──
+      // Storage is API-only. Object bytes are served by PUBLIC_R2_HOST.
+      if (req.method === "GET" || req.method === "HEAD") {
+        return downloadsDisabled(c);
+      }
+
       switch (req.method) {
-        case "PUT": {
-          if (req.headers.has("X-Chunk-Index")) return await putChunk(req, c, env);
-          if (req.headers.has("X-Safe-Path")) return await putSafe(req, c, env);
-          return await put(req, c, env);
-        }
-        case "GET":
-        case "HEAD": {
-          if (!path || path.length > 1024 || /\.\.|\/\/|[\x00-\x1f]/.test(path)) {
-            return fail(400);
-          }
-          if (path.startsWith("chunked/")) {
-            const inner = path.slice("chunked/".length);
-            if (!inner) return fail(400);
-            return await getChunked(req, ctx, url, c, inner);
-          }
-          return await get(req, ctx, url, c, `${c.PREFIX}/${path}`);
-        }
         case "DELETE": {
-          if (!path || path.length > 1024 || /\.\.|\/\/|[\x00-\x1f]/.test(path)) {
-            return fail(400);
-          }
-          if (path.startsWith("chunked/")) {
-            const inner = path.slice("chunked/".length);
-            if (!inner) return fail(400);
-            return await delChunked(req, ctx, url, c, inner);
-          }
-          if (getSafeId(path)) return await delSafe(req, ctx, url, c, path);
-          return await del(req, ctx, url, c, path, `${c.PREFIX}/${path}`);
+          return fail(403, "Storage deletes are disabled");
         }
         default:
           return fail(405);
@@ -405,14 +459,14 @@ function apiIndex(req, url, c) {
 
   const doc = {
     service: "Nightcord Storage",
-    version: "2.0.0",
+    version: "2.1.0",
     description:
-      "Object storage proxy with SEKAI v2 resource facade. New clients should use the direct-upload flow; legacy upload paths remain compatible.",
+      "Host-separated upload API and public object delivery for Nightcord storage.",
     hosts: {
       storage: storageHost,
       r2: r2Host,
       upload: uploadHost,
-      note: "The storage host signs and confirms uploads. File bytes go directly through the dedicated upload host to OSS; public media resolves through the storage or media host.",
+      note: "storage serves API only, upload accepts signed file bodies only, and r2 serves object downloads only.",
     },
     sekaiv2: {
       direct_upload: {
@@ -482,44 +536,6 @@ function apiIndex(req, url, c) {
         },
         gateway_requirements: "Allow PUT and expose ETag to browser clients. STS clients use OSS V1 presigned query URLs, including security-token in the signed query.",
       },
-      upload: {
-        method: "PUT",
-        path: "/v2/upload",
-        compatibility: "Legacy single-request upload. Still supported, but file bytes traverse Cloudflare and are subject to its request-body limit.",
-        headers: {
-          "X-Filename": "percent-encoded original filename (required)",
-          "Content-Type": "MIME type",
-          "Content-Length": "bytes",
-          "X-Sekai-Kind": "image | file | sticker (optional; inferred from MIME)",
-          "X-Image-Width": "optional int",
-          "X-Image-Height": "optional int",
-        },
-        response: {
-          uuid: "resource id (use as SEKAI payload)",
-          key: "same as uuid",
-          type: "MIME",
-          size: "kilobytes (float)",
-          size_bytes: "bytes",
-          name: "original filename",
-          kind: "image | file | sticker",
-          url: "/images/{uuid} or /files/{uuid} or /stickers/{uuid}",
-          w: "optional",
-          h: "optional",
-        },
-        example: `curl -X PUT ${origin}/v2/upload -H "X-Filename: photo.jpg" -H "Content-Type: image/jpeg" --data-binary @photo.jpg`,
-        limits: {
-          anonymous_max_bytes: ANON_MAX_UPLOAD_BYTES,
-          authenticated_max_bytes: c.WORKER_UPLOAD_MAX_BYTES,
-          note:
-            "Uploads up to 512 MiB are anonymous. Larger uploads up to the configured Worker-body limit require a " +
-            "SEKAI Pass access token via 'Authorization: Bearer <token>'; without one they return 401. " +
-            "Cloudflare's per-plan request-body limit may reject the request before this Worker runs.",
-        },
-        auth: {
-          header: "Authorization: Bearer <sekai-pass-access-token>",
-          required_when: "Content-Length > 536870912 (512 MiB)",
-        },
-      },
       resolve: {
         methods: ["GET", "HEAD"],
         paths: [
@@ -529,14 +545,21 @@ function apiIndex(req, url, c) {
         ],
         notes: [
           "UUID is a standard UUID v4 string.",
-          "Objects are stored under AttachFiles/sekai/{uuid}{ext} on OSS.",
+          "Objects are stored under AttachFiles/sekai/{uuid} on OSS with x-oss-meta-sekai-* metadata.",
+          "The storage host rejects these paths; clients must use the configured r2 host directly.",
           "Public Cache-Control: immutable (long TTL) for successful GETs.",
         ],
+      },
+      gallery_manifest_upload: {
+        method: "POST",
+        path: "/v2/upload/gallery/init",
+        body: { size: 4096 },
+        note: "Returns an exact-key PostObject form for public/gallery/manifest.json.",
       },
       meta: {
         method: "GET",
         path: "/v2/meta/{uuid}",
-        description: "JSON metadata written at upload time (best-effort).",
+        description: "JSON metadata derived from OSS object metadata.",
       },
       message_payload: {
         image: "<$SEKAI:Image:w=…;h=…;name=…:{uuid}>",
@@ -544,30 +567,16 @@ function apiIndex(req, url, c) {
         custom_stamp: "<$SEKAI:Stamp:custom=true:{uuid}>",
       },
     },
-    legacy: {
-      upload: {
-        method: "PUT",
-        path: "/",
-        headers: ["X-Filename", "Content-Type", "Content-Length"],
-        optional: ["X-Safe-Path", "X-Chunk-Index / X-Chunk-Total / X-File-ID (chunked)"],
-        response: { key: "{uid}/{fileUuid}.ext", url: "/{key}", size: "bytes" },
-      },
-      resolve: {
-        methods: ["GET", "HEAD", "DELETE"],
-        path: "/{key}",
-        chunked: "/chunked/{inner}",
-      },
-    },
     caching: {
       eligible:
-        "Public media (images/files/stickers, legacy keys). Exclude / and /v2/* from cache eligibility.",
-      see: "Cloudflare Cache Rules on storage.* and r2.*",
+        "Public media on r2.*. Exclude storage API paths from cache eligibility.",
+      see: "Cache Rules on the r2 reverse proxy.",
     },
     policy: {
       summary:
         "Anonymous file service. Arbitrary file types are allowed (including executables). " +
-        "Illegal content is prohibited and removed on report. Stored objects are served as " +
-        "downloads (Content-Disposition: attachment) with X-Content-Type-Options: nosniff.",
+        "Illegal content is prohibited and removed on report. Public objects are served only " +
+        "through the r2 host with X-Content-Type-Options: nosniff.",
       report:
         "Report abuse or illegal content" +
         (c && c.ABUSE_REPORT_EMAIL ? ` to ${c.ABUSE_REPORT_EMAIL}` : " via the configured abuse contact") +
@@ -649,9 +658,10 @@ function renderApiText(doc, origin) {
     "Primary endpoints:",
     "POST /v2/upload/init",
     "POST /v2/upload/complete",
+    "POST /v2/upload/gallery/init",
     "POST /v2/upload/multipart/init",
     "POST /v2/upload/multipart/complete",
-    "GET|HEAD /images/{uuid} | /files/{uuid} | /stickers/{uuid}",
+    "GET|HEAD {R2}/images/{uuid} | /files/{uuid} | /stickers/{uuid}",
     "GET /v2/meta/{uuid}",
     "",
     "Representations:",
@@ -679,8 +689,8 @@ function renderApiMarkdown(doc, origin) {
   lines.push("");
   lines.push(`| Role | URL |`);
   lines.push(`|------|-----|`);
-  lines.push(`| Storage (upload + legacy) | \`${doc.hosts.storage}\` |`);
-  lines.push(`| R2 facade (public media) | \`${doc.hosts.r2}\` |`);
+  lines.push(`| Storage API | \`${doc.hosts.storage}\` |`);
+  lines.push(`| R2 public media | \`${doc.hosts.r2}\` |`);
   lines.push(`| Direct upload gateway | \`${doc.hosts.upload || "not configured"}\` |`);
   lines.push("");
   lines.push(doc.hosts.note);
@@ -694,6 +704,8 @@ function renderApiMarkdown(doc, origin) {
   lines.push("3. `POST /v2/upload/complete` with `{ token: complete_token }`.");
   lines.push("");
   lines.push("The file body goes through the dedicated upload gateway directly to OSS. It does not traverse this Worker.");
+  lines.push("");
+  lines.push("Gallery manifest updates use `POST /v2/upload/gallery/init`, then POST the returned exact-key form to `upload.url`.");
   lines.push("");
   lines.push("### Multipart direct upload");
   lines.push("");
@@ -710,34 +722,10 @@ function renderApiMarkdown(doc, origin) {
   lines.push("");
   lines.push("The upload gateway must allow PUT and expose the `ETag` response header to browser clients.");
   lines.push("");
-  lines.push("### Compatibility upload");
-  lines.push("");
-  lines.push("```http");
-  lines.push("PUT /v2/upload");
-  lines.push("X-Filename: <percent-encoded filename>");
-  lines.push("Content-Type: <mime>");
-  lines.push("Content-Length: <bytes>");
-  lines.push("X-Sekai-Kind: image | file | sticker   # optional");
-  lines.push("X-Image-Width: <int>                 # optional");
-  lines.push("X-Image-Height: <int>                # optional");
-  lines.push("");
-  lines.push("<raw file bytes>");
-  lines.push("```");
-  lines.push("");
-  lines.push("**Response fields:** `uuid`, `key` (=uuid), `type`, `size` (kB), `size_bytes`, `name`, `kind`, `url`, optional `w`/`h`.");
-  lines.push("");
-  lines.push(`**Service size limits:** anonymous uploads up to **512 MiB**. Larger uploads up to ${doc.sekaiv2.upload.limits.authenticated_max_bytes} bytes require a SEKAI Pass token via \`Authorization: Bearer <token>\` (else \`401\`). Cloudflare's per-plan request-body limit may reject the request before this compatibility endpoint runs.`);
-  lines.push("");
-  lines.push("**Example:**");
-  lines.push("");
-  lines.push("```bash");
-  lines.push(doc.sekaiv2.upload.example);
-  lines.push("```");
-  lines.push("");
   lines.push("### Resolve");
   lines.push("");
   for (const p of doc.sekaiv2.resolve.paths) {
-    lines.push(`- \`GET|HEAD ${p}\``);
+    lines.push(`- \`GET|HEAD ${doc.hosts.r2}${p}\``);
   }
   lines.push(`- \`GET ${doc.sekaiv2.meta.path}\` — ${doc.sekaiv2.meta.description}`);
   lines.push("");
@@ -752,14 +740,6 @@ function renderApiMarkdown(doc, origin) {
   lines.push(doc.sekaiv2.message_payload.file);
   lines.push(doc.sekaiv2.message_payload.custom_stamp);
   lines.push("```");
-  lines.push("");
-  lines.push("## Legacy (still supported)");
-  lines.push("");
-  lines.push("- `PUT /` → `{ key, url, size }` where `key` is `{uid}/{fileUuid}.ext`");
-  lines.push("- `GET|HEAD|DELETE /{key}`");
-  lines.push("- Chunked: `/chunked/…`");
-  lines.push("");
-  lines.push("Use for older clients and historical messages. New Nightcord builds use v2.");
   lines.push("");
   lines.push("## Caching");
   lines.push("");
@@ -787,7 +767,7 @@ function renderApiMarkdown(doc, origin) {
   lines.push("---");
   lines.push("");
   lines.push(
-    "*Nightcord storage worker · SEKAI resource facade · same Worker on `storage.*` and `r2.*`*",
+    "*Nightcord storage worker · upload/API host · public media belongs on `r2.*`*",
   );
   lines.push("");
   return lines.join("\n");
@@ -936,11 +916,11 @@ function renderApiHtml(doc, origin) {
     <h2>Hosts</h2>
     <div class="grid two">
       <div class="card-mini">
-        <strong>Storage (upload + legacy)</strong>
+        <strong>Storage API</strong>
         <code>${esc(doc.hosts.storage)}</code>
       </div>
       <div class="card-mini">
-        <strong>R2 facade (public media)</strong>
+        <strong>R2 public media</strong>
         <code>${esc(doc.hosts.r2)}</code>
       </div>
       <div class="card-mini">
@@ -960,6 +940,7 @@ function renderApiHtml(doc, origin) {
       <li><code>POST /v2/upload/complete</code> with JSON <code>{ token: complete_token }</code>.</li>
     </ol>
     <p style="color:var(--muted);font-size:0.9rem">File bytes go through the dedicated upload gateway directly to OSS, bypassing Worker request-body limits.</p>
+    <p style="color:var(--muted);font-size:0.9rem">Gallery manifest updates use <code>POST /v2/upload/gallery/init</code>, then POST the returned form to <code>upload.url</code>.</p>
 
     <h3><span class="method put">POST</span>Multipart direct upload</h3>
     <ol>
@@ -970,25 +951,11 @@ function renderApiHtml(doc, origin) {
     <p style="color:var(--muted);font-size:0.9rem">Default part size: <code>${esc(doc.sekaiv2.multipart_upload.default_part_size)}</code> bytes; recommended concurrency: <code>${esc(doc.sekaiv2.multipart_upload.recommended_concurrency)}</code>. Maximum part: <code>${esc(doc.sekaiv2.multipart_upload.max_part_bytes)}</code> bytes; maximum parts: <code>${esc(doc.sekaiv2.multipart_upload.max_parts)}</code>; maximum object: <code>${esc(doc.sekaiv2.multipart_upload.max_file_bytes)}</code> bytes.</p>
     <p style="color:var(--muted);font-size:0.9rem">The upload gateway must allow PUT and expose <code>ETag</code> to browser clients.</p>
 
-    <h3>Compatibility upload</h3>
-    <h3><span class="method put">PUT</span><code>/v2/upload</code></h3>
-    <table>
-      <tr><th>Headers</th><td>
-        <code>X-Filename</code>, <code>Content-Type</code>, <code>Content-Length</code><br/>
-        optional: <code>X-Sekai-Kind</code>, <code>X-Image-Width</code>, <code>X-Image-Height</code><br/>
-        for uploads &gt; 512 MiB: <code>Authorization: Bearer &lt;sekai-pass-token&gt;</code>
-      </td></tr>
-      <tr><th>Body</th><td>raw file bytes</td></tr>
-      <tr><th>Limits</th><td>Anonymous &le; <strong>512 MiB</strong>. Larger uploads up to <code>${esc(doc.sekaiv2.upload.limits.authenticated_max_bytes)}</code> bytes need a SEKAI Pass token. Cloudflare's request-body limit may reject the request before this compatibility endpoint runs.</td></tr>
-      <tr><th>Response</th><td><code>uuid</code>, <code>type</code>, <code>size</code> (kB), <code>name</code>, <code>kind</code>, <code>url</code>, optional <code>w</code>/<code>h</code></td></tr>
-    </table>
-    <pre>${esc(doc.sekaiv2.upload.example)}</pre>
-
     <h3><span class="method get">GET</span> Resolve</h3>
     <ul>
-      <li><code>/images/{uuid}</code></li>
-      <li><code>/files/{uuid}</code></li>
-      <li><code>/stickers/{uuid}</code></li>
+      <li><code>${esc(doc.hosts.r2)}/images/{uuid}</code></li>
+      <li><code>${esc(doc.hosts.r2)}/files/{uuid}</code></li>
+      <li><code>${esc(doc.hosts.r2)}/stickers/{uuid}</code></li>
       <li><code>/v2/meta/{uuid}</code> — JSON metadata</li>
     </ul>
 
@@ -996,13 +963,6 @@ function renderApiHtml(doc, origin) {
     <pre>${esc(doc.sekaiv2.message_payload.image)}
 ${esc(doc.sekaiv2.message_payload.file)}
 ${esc(doc.sekaiv2.message_payload.custom_stamp)}</pre>
-  </section>
-
-  <section>
-    <h2>Legacy — still supported</h2>
-    <p><span class="method put">PUT</span><code>/</code> → <code>{ key, url, size }</code> where key is <code>{uid}/{fileUuid}.ext</code></p>
-    <p><span class="method get">GET</span><span class="method del">DEL</span><code>/{key}</code> · chunked under <code>/chunked/…</code></p>
-    <p style="color:var(--muted);font-size:0.9rem;margin:0">Use for older clients and historical messages. New Nightcord builds use v2.</p>
   </section>
 
   <section>
@@ -1028,7 +988,7 @@ ${esc(doc.sekaiv2.message_payload.custom_stamp)}</pre>
   </section>
 
   <footer>
-    Nightcord storage worker · SEKAI resource facade · same Worker on storage.* and r2.*
+    Nightcord storage worker · upload/API host · public media belongs on r2.*
   </footer>
 </main>
 </body>
@@ -1078,47 +1038,6 @@ function inferKind(mime, hint) {
   const m = (mime || "").toLowerCase();
   if (m.startsWith("image/")) return "image";
   return "file";
-}
-
-/**
- * Best-effort meta sidecar → AttachFiles/sekai/{uuid}.json
- * Does not throw; failures are logged only.
- */
-async function persistSekaiMeta(c, meta) {
-  const SEKAI_USER = "sekai";
-  try {
-    const metaKey = `${c.PREFIX}/${SEKAI_USER}/${meta.uuid}.json`;
-    const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
-    const mr = await uploadObject(c, {
-      userid: SEKAI_USER,
-      ossKey: metaKey,
-      contentType: "application/json",
-      displayName: `${meta.uuid}.json`,
-      cdValue: 'inline; filename="_meta.json"',
-      body: metaBytes,
-      bodySize: metaBytes.byteLength,
-    });
-    if (!mr) {
-      console.warn("v2 meta upload failed: no sign/response", meta.uuid);
-      return;
-    }
-    if (mr.status !== 200 && mr.status !== 201 && mr.status !== 204) {
-      const errText = await mr.text().catch(() => "");
-      console.warn("v2 meta upload failed:", mr.status, errText.slice(0, 200));
-    }
-    await drain(mr);
-  } catch (e) {
-    console.warn("v2 meta upload failed:", e);
-  }
-}
-
-function scheduleSekaiMeta(c, meta, ctx) {
-  const promise = persistSekaiMeta(c, meta);
-  if (ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(promise);
-  } else {
-    void promise;
-  }
 }
 
 function base64UrlEncode(data) {
@@ -1381,8 +1300,7 @@ async function initSekaiV2Upload(req, c, env) {
   const uuid = crypto.randomUUID();
   const kind = inferKind(contentType, input.kind);
   const ext = extOf(rawName);
-  const objectMetaLayout = c.DIRECT_UPLOAD_OBJECT_METADATA;
-  const ossKey = `${c.PREFIX}/sekai/${uuid}${objectMetaLayout ? "" : ext}`;
+  const ossKey = `${c.PREFIX}/sekai/${uuid}`;
   const display = sanitize(rawName);
   const cdValue = buildContentDisposition(display);
 
@@ -1391,9 +1309,7 @@ async function initSekaiV2Upload(req, c, env) {
   if (!Number.isInteger(w) || w <= 0) w = undefined;
   if (!Number.isInteger(h) || h <= 0) h = undefined;
   const created = Math.floor(Date.now() / 1000);
-  const objectMetadata = objectMetaLayout
-    ? buildDirectObjectMetadata({ name: rawName, kind, created, w, h })
-    : {};
+  const objectMetadata = buildDirectObjectMetadata({ name: rawName, kind, created, w, h });
   const direct = await signDirectUploadPolicy(
     c,
     ossKey,
@@ -1403,7 +1319,7 @@ async function initSekaiV2Upload(req, c, env) {
     objectMetadata,
   );
   const tokenPayload = {
-    v: objectMetaLayout ? 2 : 1,
+    v: 2,
     exp: direct.expiresAt + 15 * 60,
     uuid,
     kind,
@@ -1412,7 +1328,7 @@ async function initSekaiV2Upload(req, c, env) {
     size: fileSize,
     ext,
     ossKey,
-    ...(objectMetaLayout ? { created } : {}),
+    created,
     ...(w ? { w } : {}),
     ...(h ? { h } : {}),
   };
@@ -1440,14 +1356,53 @@ async function initSekaiV2Upload(req, c, env) {
   }, { "Cache-Control": "no-store" });
 }
 
+async function initGalleryManifestUpload(req, c) {
+  if (!(c.AKS && c.PUBLIC_UPLOAD_HOST)) {
+    return fail(501, "Direct upload is not configured");
+  }
+  const input = await readJson(req);
+  const fileSize = Number(input && input.size);
+  if (!Number.isSafeInteger(fileSize) || fileSize <= 0 || fileSize > 2 * MIB) {
+    return fail(400, "Invalid gallery manifest size");
+  }
+
+  const ossKey = `${c.PREFIX}/public/gallery/manifest.json`;
+  const contentType = "application/json";
+  const cdValue = 'inline; filename="manifest.json"';
+  const direct = await signDirectUploadPolicy(
+    c,
+    ossKey,
+    fileSize,
+    contentType,
+    cdValue,
+  );
+  return ok({
+    upload: {
+      url: `${c.PUBLIC_UPLOAD_HOST}/`,
+      method: "POST",
+      expires_at: new Date(direct.expiresAt * 1000).toISOString(),
+      fields: {
+        key: ossKey,
+        policy: direct.policy,
+        Signature: direct.signature,
+        OSSAccessKeyId: c.AKID,
+        success_action_status: "204",
+        "Content-Type": contentType,
+        "Content-Disposition": cdValue,
+      },
+    },
+  }, { "Cache-Control": "no-store" });
+}
+
 async function completeSekaiV2Upload(req, c, ctx) {
+  void ctx;
   if (!(c.AKS && c.UPLOAD_TOKEN_SECRET)) return fail(501, "Direct upload is not configured");
   const input = await readJson(req);
   const payload = input && await verifyUploadToken(c, input.token);
-  if (!payload || (payload.v !== 1 && payload.v !== 2) || !UUID_RE.test(payload.uuid)) {
+  if (!payload || payload.v !== 2 || !UUID_RE.test(payload.uuid)) {
     return fail(400, "Invalid or expired upload token");
   }
-  const expectedKey = `${c.PREFIX}/sekai/${payload.uuid}${payload.v === 2 ? "" : payload.ext || ""}`;
+  const expectedKey = `${c.PREFIX}/sekai/${payload.uuid}`;
   if (payload.ossKey !== expectedKey) {
     return fail(400, "Invalid upload token");
   }
@@ -1463,14 +1418,11 @@ async function completeSekaiV2Upload(req, c, ctx) {
   }
   const storedSize = Number(head.headers.get("Content-Length"));
   const storedType = head.headers.get("Content-Type") || "";
-  const storedObjectMeta = payload.v === 2
-    ? metaFromObjectHeaders(payload.uuid, payload.ossKey, head.headers)
-    : null;
+  const storedObjectMeta = metaFromObjectHeaders(payload.uuid, payload.ossKey, head.headers);
   await drain(head);
   if (storedSize !== payload.size) return fail(409, "Uploaded object size does not match");
   if (storedType && storedType !== payload.type) return fail(409, "Uploaded object type does not match");
   if (
-    payload.v === 2 &&
     (!storedObjectMeta ||
       storedObjectMeta.name !== payload.name ||
       storedObjectMeta.kind !== payload.kind ||
@@ -1495,8 +1447,6 @@ async function completeSekaiV2Upload(req, c, ctx) {
     ...(payload.w ? { w: payload.w } : {}),
     ...(payload.h ? { h: payload.h } : {}),
   };
-  if (payload.v === 1) scheduleSekaiMeta(c, meta, ctx);
-
   return ok({
     uuid: payload.uuid,
     key: payload.uuid,
@@ -1949,10 +1899,11 @@ async function abortSekaiV2MultipartUpload(req, c) {
 
 /**
  * PUT /v2/upload
- * OSS: AttachFiles/sekai/{uuid}{ext}
- * Meta: AttachFiles/sekai/{uuid}.json (async via waitUntil — does not block 200)
+ * OSS: AttachFiles/sekai/{uuid}
+ * Meta: x-oss-meta-sekai-* on the object
  */
 async function putSekaiV2(req, c, ctx, env) {
+  void ctx;
   if (!c.AKID) return fail(500, "OSS_AKID not configured");
 
   const encodedName = (req.headers.get("X-Filename") || "file").trim();
@@ -1976,12 +1927,19 @@ async function putSekaiV2(req, c, ctx, env) {
   const kind = inferKind(ct, req.headers.get("X-Sekai-Kind"));
   const uuid = crypto.randomUUID();
   const ext = extOf(rawName);
-  // OSS layout: AttachFiles/sekai/{uuid}{ext}
+  // OSS layout: AttachFiles/sekai/{uuid}; r2 directly reverse-proxies this key.
   // Policy/prefix user id = "sekai" (local policy allows AttachFiles/sekai/…)
   const SEKAI_USER = "sekai";
-  const ossKey = `${c.PREFIX}/${SEKAI_USER}/${uuid}${ext}`;
+  const ossKey = `${c.PREFIX}/${SEKAI_USER}/${uuid}`;
   const display = sanitize(rawName);
   const cdValue = buildContentDisposition(display);
+
+  let w = parseInt(req.headers.get("X-Image-Width") || "", 10);
+  let h = parseInt(req.headers.get("X-Image-Height") || "", 10);
+  if (!Number.isFinite(w) || w <= 0) w = undefined;
+  if (!Number.isFinite(h) || h <= 0) h = undefined;
+  const created = Math.floor(Date.now() / 1000);
+  const objectMetadata = buildDirectObjectMetadata({ name: rawName, kind, created, w, h });
 
   const r = await uploadObject(c, {
     userid: SEKAI_USER,
@@ -1991,6 +1949,7 @@ async function putSekaiV2(req, c, ctx, env) {
     cdValue,
     body: req.body,
     bodySize: fileSize,
+    objectMetadata,
   });
   if (!r) return fail(502);
   if (r.status !== 200 && r.status !== 201 && r.status !== 204) {
@@ -2004,11 +1963,6 @@ async function putSekaiV2(req, c, ctx, env) {
   }
   await drain(r);
 
-  let w = parseInt(req.headers.get("X-Image-Width") || "", 10);
-  let h = parseInt(req.headers.get("X-Image-Height") || "", 10);
-  if (!Number.isFinite(w) || w <= 0) w = undefined;
-  if (!Number.isFinite(h) || h <= 0) h = undefined;
-
   const sizeKb = Math.round((fileSize / 1024) * 10) / 10;
   const meta = {
     uuid,
@@ -2019,12 +1973,10 @@ async function putSekaiV2(req, c, ctx, env) {
     size: sizeKb,
     ext,
     ossKey,
-    created: new Date().toISOString(),
+    created: new Date(created * 1000).toISOString(),
   };
   if (w) meta.w = w;
   if (h) meta.h = h;
-
-  scheduleSekaiMeta(c, meta, ctx);
 
   const publicPath = `/${kind === "sticker" ? "stickers" : kind === "image" ? "images" : "files"}/${uuid}`;
 
@@ -2045,67 +1997,40 @@ async function putSekaiV2(req, c, ctx, env) {
 async function loadSekaiMeta(c, uuid) {
   if (!UUID_RE.test(uuid)) return null;
   const objectKey = `${c.PREFIX}/sekai/${uuid}`;
-  const objectHead = await fetch(`${c.OSS_HOST}/${objectKey}`, { method: "HEAD" });
-  if (objectHead.ok) {
-    const objectMeta = metaFromObjectHeaders(uuid, objectKey, objectHead.headers);
+  const objectHead = c.AKS
+    ? await headObjectSigned(c, objectKey)
+    : await fetch(`${c.OSS_HOST}/${encodeOssKey(objectKey)}`, { method: "HEAD" });
+  if (!objectHead.ok) {
     await drain(objectHead);
-    if (objectMeta) return objectMeta;
-  } else {
-    await drain(objectHead);
-  }
-
-  const metaKey = `${c.PREFIX}/sekai/${uuid}.json`;
-  const r = await fetch(`${c.OSS_HOST}/${metaKey}`);
-  if (r.status === 404) {
-    await drain(r);
     return null;
   }
-  if (!r.ok) {
-    await drain(r);
-    return null;
-  }
-  try {
-    return await r.json();
-  } catch {
-    return null;
-  }
+  const objectMeta = metaFromObjectHeaders(uuid, objectKey, objectHead.headers);
+  await drain(objectHead);
+  return objectMeta;
 }
 
 async function resolveSekaiOssKey(c, uuid) {
   const meta = await loadSekaiMeta(c, uuid);
   if (meta && meta.ossKey) return { ossKey: meta.ossKey, meta };
-
-  // Fallback: probe common extensions in parallel when meta is missing
-  const probes = await Promise.all(
-    SEKAI_PROBE_EXTS.map(async (ext) => {
-      const ossKey = `${c.PREFIX}/sekai/${uuid}${ext}`;
-      try {
-        const head = await fetch(`${c.OSS_HOST}/${ossKey}`, { method: "HEAD" });
-        const ok = head.ok;
-        const type = head.headers.get("Content-Type") || "application/octet-stream";
-        await drain(head);
-        return ok ? { ossKey, type } : null;
-      } catch {
-        return null;
-      }
-    }),
-  );
-  const hit = probes.find(Boolean);
-  if (!hit) return null;
-  return {
-    ossKey: hit.ossKey,
-    meta: meta || { uuid, type: hit.type },
-  };
+  return null;
 }
 
 async function getSekaiObject(req, ctx, url, c, kind, uuid) {
+  void ctx;
   if (!UUID_RE.test(uuid)) return fail(400);
-
-  const resolved = await resolveSekaiOssKey(c, uuid);
-  if (!resolved) return fail(404);
-
-  // Reuse legacy GET proxy against concrete ossKey
-  return await get(req, ctx, url, c, resolved.ossKey);
+  const publicBase = c.PUBLIC_R2_HOST;
+  if (!publicBase) {
+    return fail(501, "Public media host is not configured");
+  }
+  const target = `${publicBase}/${kind}/${uuid}${url.search}`;
+  return new Response(null, {
+    status: 308,
+    headers: {
+      ...CORS_HEADERS,
+      Location: target,
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
 async function getSekaiMeta(req, c, uuid) {
@@ -2446,11 +2371,20 @@ function bodyToStream(body) {
  * Streams the request body as-is — no multipart wrapper.
  * Signs CanonicalizedResource as /{bucket}/{key} (required for custom domains too).
  */
-async function putObjectOSS(c, ossKey, contentType, body, bodySize) {
+async function putObjectOSS(c, ossKey, contentType, body, bodySize, objectMetadata = {}) {
   const date = new Date().toUTCString();
   const ct = contentType || "application/octet-stream";
   const resource = `/${c.BUCKET}/${ossKey}`;
-  const stringToSign = `PUT\n\n${ct}\n${date}\n${resource}`;
+  const headers = new Headers({
+    "Content-Type": ct,
+    "Content-Length": String(bodySize),
+    Date: date,
+    ...objectMetadata,
+  });
+  const stringToSign =
+    `PUT\n\n${ct}\n${date}\n` +
+    canonicalizeOssHeaders(headers) +
+    resource;
   const signature = await hmacSha1Base64(c.AKS, stringToSign);
   const stream = bodyToStream(body);
   if (!stream) throw new Error("unsupported body type for PutObject");
@@ -2464,9 +2398,7 @@ async function putObjectOSS(c, ossKey, contentType, body, bodySize) {
   return fetch(`${base}/${path}`, {
     method: "PUT",
     headers: {
-      "Content-Type": ct,
-      "Content-Length": String(bodySize),
-      Date: date,
+      ...Object.fromEntries(headers.entries()),
       Authorization: `OSS ${c.AKID}:${signature}`,
     },
     body: stream,
@@ -2483,7 +2415,19 @@ function toUint8(body) {
   return null;
 }
 
-async function postToOSSOnce(uploadHost, c, ossKey, policy, sig, contentType, displayName, cdValue, body, bodySize) {
+async function postToOSSOnce(
+  uploadHost,
+  c,
+  ossKey,
+  policy,
+  sig,
+  contentType,
+  displayName,
+  cdValue,
+  body,
+  bodySize,
+  objectMetadata = {},
+) {
   const boundary = "----CfWkrBnd" + crypto.randomUUID().replace(/-/g, "");
   const dashBoundary = "--" + boundary;
   const crlf = "\r\n";
@@ -2495,6 +2439,7 @@ async function postToOSSOnce(uploadHost, c, ossKey, policy, sig, contentType, di
     { n: "OSSAccessKeyId", v: c.AKID },
     { n: "success_action_status", v: "204" },
     { n: "Content-Disposition", v: cdValue },
+    ...Object.entries(objectMetadata).map(([n, v]) => ({ n, v })),
   ];
 
   let head = "";
@@ -2548,7 +2493,18 @@ async function postToOSSOnce(uploadHost, c, ossKey, policy, sig, contentType, di
   });
 }
 
-async function postToOSS(c, ossKey, policy, sig, contentType, displayName, cdValue, body, bodySize) {
+async function postToOSS(
+  c,
+  ossKey,
+  policy,
+  sig,
+  contentType,
+  displayName,
+  cdValue,
+  body,
+  bodySize,
+  objectMetadata = {},
+) {
   const primary = c.UPLOAD_HOST || c.OSS_HOST;
   const regional = c.OSS_HOST;
   const r = await postToOSSOnce(
@@ -2562,6 +2518,7 @@ async function postToOSS(c, ossKey, policy, sig, contentType, displayName, cdVal
     cdValue,
     body,
     bodySize,
+    objectMetadata,
   );
 
   if ((r.status === 200 || r.status === 201 || r.status === 204) || primary === regional) {
@@ -2589,6 +2546,7 @@ async function postToOSS(c, ossKey, policy, sig, contentType, displayName, cdVal
     cdValue,
     buffered,
     buffered.byteLength,
+    objectMetadata,
   );
 }
 
@@ -2602,7 +2560,16 @@ async function postToOSS(c, ossKey, policy, sig, contentType, displayName, cdVal
  * Without OSS_AKS: PostObject via SIGN_BACKEND (legacy).
  */
 async function uploadObject(c, opts) {
-  const { userid, ossKey, contentType, displayName, cdValue, body, bodySize } = opts;
+  const {
+    userid,
+    ossKey,
+    contentType,
+    displayName,
+    cdValue,
+    body,
+    bodySize,
+    objectMetadata = {},
+  } = opts;
 
   // CF-edge benches (LAX): regional PutObject was ~4× slower than PostObject.
   // Only use PutObject when explicitly requested.
@@ -2612,7 +2579,7 @@ async function uploadObject(c, opts) {
 
   if (preferPut) {
     try {
-      const r = await putObjectOSS(c, ossKey, contentType, body, bodySize);
+      const r = await putObjectOSS(c, ossKey, contentType, body, bodySize, objectMetadata);
       if (r.status === 200 || r.status === 201 || r.status === 204) return r;
 
       const errText = await r.text().catch(() => "");
@@ -2634,6 +2601,7 @@ async function uploadObject(c, opts) {
         cdValue,
         buffered,
         buffered.byteLength,
+        objectMetadata,
       );
     } catch (e) {
       console.warn("PutObject error:", e && e.message ? e.message : e);
@@ -2654,6 +2622,7 @@ async function uploadObject(c, opts) {
     cdValue,
     buffered || body,
     bodySize,
+    objectMetadata,
   );
 }
 

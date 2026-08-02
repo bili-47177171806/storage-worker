@@ -12,11 +12,6 @@ const ENV = {
   PUBLIC_UPLOAD_HOST: 'https://upload.example.com/',
 };
 
-const LEGACY_JSON_ENV = {
-  ...ENV,
-  DIRECT_UPLOAD_OBJECT_METADATA: '0',
-};
-
 function jsonRequest(path, body, headers = {}) {
   return new Request(`https://storage.example.com${path}`, {
     method: 'POST',
@@ -100,21 +95,6 @@ describe('direct upload init', () => {
     assert.equal(response.status, 413);
   });
 
-  test('can explicitly roll back to the JSON sidecar layout', async () => {
-    const response = await worker.fetch(
-      jsonRequest('/v2/upload/init', {
-        name: 'photo.JPG',
-        type: 'image/jpeg',
-        size: 12345,
-      }),
-      LEGACY_JSON_ENV,
-      {},
-    );
-    assert.equal(response.status, 200);
-    const result = await response.json();
-    assert.match(result.upload.fields.key, /^AttachFiles\/sekai\/[0-9a-f-]+\.jpg$/);
-    assert.equal(result.upload.fields['x-oss-meta-sekai-version'], undefined);
-  });
 });
 
 describe('direct upload complete', () => {
@@ -136,56 +116,46 @@ describe('direct upload complete', () => {
     assert.match((await response.json()).error, /Invalid or expired/);
   });
 
-  test('writes metadata through waitUntil after returning the response', async () => {
+  test('requires OSS object metadata and does not schedule JSON metadata writes', async () => {
     const initResponse = await worker.fetch(
       jsonRequest('/v2/upload/init', {
         name: 'async.bin',
         type: 'application/octet-stream',
         size: 8,
       }),
-      LEGACY_JSON_ENV,
+      ENV,
       {},
     );
     const init = await initResponse.json();
+    const fields = init.upload.fields;
 
     const originalFetch = globalThis.fetch;
-    let releaseMetadata;
-    const metadataGate = new Promise((resolve) => { releaseMetadata = resolve; });
-    let metadataStarted;
-    const metadataStartedPromise = new Promise((resolve) => { metadataStarted = resolve; });
     let backgroundTask;
-
     globalThis.fetch = async (_url, options = {}) => {
-      if (options.method === 'HEAD') {
-        return new Response(null, {
-          status: 200,
-          headers: {
-            'Content-Length': '8',
-            'Content-Type': 'application/octet-stream',
-          },
-        });
-      }
-
-      metadataStarted();
-      if (options.body) await new Response(options.body).arrayBuffer();
-      await metadataGate;
-      return new Response(null, { status: 204 });
+      assert.equal(options.method, 'HEAD');
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'Content-Length': '8',
+          'Content-Type': 'application/octet-stream',
+          'x-oss-meta-sekai-version': fields['x-oss-meta-sekai-version'],
+          'x-oss-meta-sekai-name': fields['x-oss-meta-sekai-name'],
+          'x-oss-meta-sekai-kind': fields['x-oss-meta-sekai-kind'],
+          'x-oss-meta-sekai-created': fields['x-oss-meta-sekai-created'],
+        },
+      });
     };
 
     try {
       const response = await worker.fetch(
         jsonRequest('/v2/upload/complete', { token: init.complete_token }),
-        LEGACY_JSON_ENV,
+        ENV,
         { waitUntil(promise) { backgroundTask = promise; } },
       );
 
       assert.equal(response.status, 200);
-      assert.ok(backgroundTask instanceof Promise);
-      await metadataStartedPromise;
-      releaseMetadata();
-      await backgroundTask;
+      assert.equal(backgroundTask, undefined);
     } finally {
-      releaseMetadata?.();
       globalThis.fetch = originalFetch;
     }
   });
@@ -229,7 +199,7 @@ describe('default OSS object metadata layout', () => {
     }
   });
 
-  test('complete verifies object metadata without writing a JSON sidecar', async () => {
+  test('complete verifies object metadata without background metadata writes', async () => {
     const initResponse = await worker.fetch(
       jsonRequest('/v2/upload/init', {
         name: '测试.txt',
@@ -319,5 +289,45 @@ describe('default OSS object metadata layout', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  test('retired PUT /v2/upload is rejected without contacting OSS', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error('OSS must not be contacted'); };
+
+    try {
+      const response = await worker.fetch(
+        new Request('https://storage.example.com/v2/upload', {
+          method: 'PUT',
+          headers: {
+            'X-Filename': encodeURIComponent('photo.JPG'),
+            'Content-Type': 'image/jpeg',
+            'Content-Length': '5',
+            'X-Sekai-Kind': 'image',
+            'X-Image-Width': '320',
+            'X-Image-Height': '180',
+          },
+          body: 'hello',
+        }),
+        { ...ENV, OSS_PUT_MODE: 'put' },
+        {},
+      );
+
+      assert.equal(response.status, 410);
+      assert.match((await response.json()).error, /retired/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('storage host rejects typed media downloads instead of redirecting', async () => {
+    const uuid = '01234567-89ab-4def-8123-456789abcdef';
+    const response = await worker.fetch(
+      new Request(`https://storage.example.com/images/${uuid}?download=1`),
+      { ...ENV, PUBLIC_R2_HOST: 'https://r2.example.com' },
+      {},
+    );
+    assert.equal(response.status, 410);
+    assert.equal(response.headers.get('Location'), null);
   });
 });
