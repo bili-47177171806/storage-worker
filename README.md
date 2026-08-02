@@ -44,16 +44,17 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 | `PUBLIC_UPLOAD_HOST` | direct upload | `[vars]` | Public upload gateway, for example `https://upload.example.com` |
 | `UPLOAD_TOKEN_SECRET` | no | **secret** | Separate HMAC secret for completion tokens; falls back to `OSS_AKS` |
 | `DIRECT_UPLOAD_OBJECT_METADATA` | no | `[vars]` | Object Metadata is enabled by default; set to `0` to use legacy JSON sidecars |
+| `MULTIPART_REQUIRE_AUTH` | no | `[vars]` | `1` by default; requires SEKAI Pass for every Multipart initialization |
 | `OSS_PUT_MODE` | no | `[vars]` | `auto` (default) / `put` / `post` |
 | `SIGN_BACKEND` | no* | `[vars]` | Remote policy API if `OSS_AKS` unset |
 | `PUBLIC_STORAGE_HOST` | no | `[vars]` | Docs only |
 | `PUBLIC_R2_HOST` | no | `[vars]` | Docs only |
 | `TERMS_URL` | no | `[vars]` | Public terms URL shown in API docs |
 | `ABUSE_REPORT_EMAIL` | no | `[vars]` | Abuse contact shown in API docs / README |
-| `AUTH_DB` | no** | `[[d1_databases]]` | SEKAI Pass D1 (`sekai_pass_db`); needed only for uploads > 512 MiB |
+| `AUTH_DB` | no** | `[[d1_databases]]` | SEKAI Pass D1 (`sekai_pass_db`); required for Multipart and uploads > 512 MiB |
 
 \* Required only when `OSS_AKS` is not set.
-\*\* Required only if you allow uploads above the 512 MiB anonymous cap. Anonymous uploads never touch it.
+\*\* Required if Multipart is enabled with its default auth requirement, or if you allow uploads above the 512 MiB anonymous cap.
 
 **Preferred:** set `OSS_AKS` so the Worker signs PostObject policy (or PutObject) locally — no external signer RTT.
 
@@ -106,6 +107,44 @@ Content-Type: application/json
 
 {"token":"<complete_token>"}
 ```
+
+### Multipart direct upload
+
+Multipart is intended for SEKAI Pass clients that need resumable parts. It uses the same
+Object Metadata layout as normal direct upload, but requires a valid `Authorization: Bearer`
+token at initialization. The default part size is `10 MiB`; all parts except the final one
+must use that size.
+
+```http
+POST /v2/upload/multipart/init
+Authorization: Bearer <sekai-pass-token>
+Content-Type: application/json
+
+{"name":"large.bin","type":"application/octet-stream","size":12582912,"kind":"file"}
+```
+
+The response provides `multipart_token`, `part_size`, and `part_count`. Request short-lived
+PUT URLs in batches of up to 20 parts:
+
+```http
+POST /v2/upload/multipart/parts
+Content-Type: application/json
+
+{"token":"<multipart_token>","part_numbers":[1,2]}
+```
+
+Upload each returned byte range with `PUT`, record its `ETag` response header, then complete:
+
+```http
+POST /v2/upload/multipart/complete
+Content-Type: application/json
+
+{"token":"<multipart_token>","parts":[{"part_number":1,"etag":"\"...\""},{"part_number":2,"etag":"\"...\""}]}
+```
+
+Use `POST /v2/upload/multipart/abort` with `{ "token": "<multipart_token>" }` to cancel an
+unfinished upload. The upload gateway must allow `PUT` and expose `ETag` through CORS; file
+bytes do not traverse the Worker.
 
 `PUT /v2/upload` remains supported for existing clients:
 

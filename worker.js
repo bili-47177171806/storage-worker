@@ -29,6 +29,10 @@ const ANON_MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 1048576000;
 /** Short-lived direct-upload form and completion token lifetime. */
 const DIRECT_UPLOAD_TTL_SECONDS = 2 * 60 * 60;
+/** Multipart uploads use fixed-size parts except for the final part. */
+const MULTIPART_PART_SIZE = 10 * 1024 * 1024;
+const MULTIPART_SIGN_BATCH_MAX = 20;
+const MULTIPART_PART_URL_TTL_SECONDS = 15 * 60;
 /** Extensions probed when v2 meta sidecar is missing (common first). */
 const SEKAI_PROBE_EXTS = [
   "",
@@ -117,6 +121,8 @@ function cfg(env) {
     TERMS_URL: String(e.TERMS_URL || "").trim(),
     DIRECT_UPLOAD_OBJECT_METADATA:
       String(e.DIRECT_UPLOAD_OBJECT_METADATA ?? "1").trim() !== "0",
+    MULTIPART_REQUIRE_AUTH:
+      String(e.MULTIPART_REQUIRE_AUTH ?? "1").trim() !== "0",
     DELETE_ENABLED: String(e.DELETE_ENABLED || "").trim() === "1",
   };
 }
@@ -197,6 +203,18 @@ export default {
       }
       if (path === "v2/upload/complete" && req.method === "POST") {
         return await completeSekaiV2Upload(req, c, ctx);
+      }
+      if (path === "v2/upload/multipart/init" && req.method === "POST") {
+        return await initSekaiV2MultipartUpload(req, c, env);
+      }
+      if (path === "v2/upload/multipart/parts" && req.method === "POST") {
+        return await signSekaiV2MultipartParts(req, c);
+      }
+      if (path === "v2/upload/multipart/complete" && req.method === "POST") {
+        return await completeSekaiV2MultipartUpload(req, c);
+      }
+      if (path === "v2/upload/multipart/abort" && req.method === "POST") {
+        return await abortSekaiV2MultipartUpload(req, c);
       }
       if (path.startsWith("v2/meta/") && (req.method === "GET" || req.method === "HEAD")) {
         const uuid = path.slice("v2/meta/".length).split("/")[0];
@@ -324,6 +342,37 @@ function apiIndex(req, url, c) {
             note: "Verifies the object on OSS and returns the normal v2 upload result.",
           },
         ],
+      },
+      multipart_upload: {
+        auth: "SEKAI Pass Bearer token is required to initialize multipart uploads",
+        part_size: MULTIPART_PART_SIZE,
+        max_signed_parts_per_request: MULTIPART_SIGN_BATCH_MAX,
+        steps: [
+          {
+            method: "POST",
+            path: "/v2/upload/multipart/init",
+            body: { name: "large.bin", type: "application/octet-stream", size: 12582912, kind: "file" },
+            note: "Initializes OSS multipart upload and returns multipart_token, part_size, and part_count.",
+          },
+          {
+            method: "POST",
+            path: "/v2/upload/multipart/parts",
+            body: { token: "multipart_token", part_numbers: [1, 2] },
+            note: "Returns short-lived PUT URLs. Upload each corresponding byte range and record the ETag response header.",
+          },
+          {
+            method: "POST",
+            path: "/v2/upload/multipart/complete",
+            body: { token: "multipart_token", parts: [{ part_number: 1, etag: "OSS ETag" }] },
+            note: "Completes OSS multipart upload, verifies object size and metadata, and returns the normal v2 response.",
+          },
+        ],
+        abort: {
+          method: "POST",
+          path: "/v2/upload/multipart/abort",
+          body: { token: "multipart_token" },
+        },
+        gateway_requirements: "Allow PUT and expose ETag to browser clients.",
       },
       upload: {
         method: "PUT",
@@ -499,6 +548,18 @@ function renderApiMarkdown(doc, origin) {
   lines.push("3. `POST /v2/upload/complete` with `{ token: complete_token }`.");
   lines.push("");
   lines.push("The file body goes through the dedicated upload gateway directly to OSS. It does not traverse this Worker.");
+  lines.push("");
+  lines.push("### Multipart direct upload");
+  lines.push("");
+  lines.push("Multipart requires a SEKAI Pass Bearer token. Use it when a client needs resumable parts or a single direct upload is unsuitable.");
+  lines.push("");
+  lines.push("1. `POST /v2/upload/multipart/init` with `{ name, type, size, kind?, w?, h? }`.");
+  lines.push(`2. Split the file into exactly ${doc.sekaiv2.multipart_upload.part_size} byte parts (the final part may be smaller).`);
+  lines.push(`3. Batch up to ${doc.sekaiv2.multipart_upload.max_signed_parts_per_request} part numbers in POST /v2/upload/multipart/parts with the returned multipart_token, then PUT each part to its returned URL and record ETag.`);
+  lines.push("4. `POST /v2/upload/multipart/complete` with `{ token: multipart_token, parts: [{ part_number, etag }] }`.");
+  lines.push("5. Use `POST /v2/upload/multipart/abort` with `{ token: multipart_token }` to abandon an unfinished upload.");
+  lines.push("");
+  lines.push("The upload gateway must allow PUT and expose the `ETag` response header to browser clients.");
   lines.push("");
   lines.push("### Compatibility upload");
   lines.push("");
@@ -749,6 +810,14 @@ function renderApiHtml(doc, origin) {
       <li><code>POST /v2/upload/complete</code> with JSON <code>{ token: complete_token }</code>.</li>
     </ol>
     <p style="color:var(--muted);font-size:0.9rem">File bytes go through the dedicated upload gateway directly to OSS, bypassing Worker request-body limits.</p>
+
+    <h3><span class="method put">POST</span>Multipart direct upload</h3>
+    <ol>
+      <li><code>POST /v2/upload/multipart/init</code> with JSON <code>{ name, type, size, kind?, w?, h? }</code> and a SEKAI Pass Bearer token.</li>
+      <li>Split into <code>${esc(doc.sekaiv2.multipart_upload.part_size)}</code>-byte parts, request PUT URLs in batches from <code>POST /v2/upload/multipart/parts</code>, then record every upload response <code>ETag</code>.</li>
+      <li><code>POST /v2/upload/multipart/complete</code> with the token and <code>{ part_number, etag }</code> entries. Use <code>/multipart/abort</code> to abandon an unfinished upload.</li>
+    </ol>
+    <p style="color:var(--muted);font-size:0.9rem">The upload gateway must allow PUT and expose <code>ETag</code> to browser clients.</p>
 
     <h3>Compatibility upload</h3>
     <h3><span class="method put">PUT</span><code>/v2/upload</code></h3>
@@ -1015,6 +1084,58 @@ async function headObjectSigned(c, ossKey) {
   });
 }
 
+function encodeOssKey(ossKey) {
+  return ossKey.split("/").map((part) => encodeURIComponent(part)).join("/");
+}
+
+function canonicalizeOssHeaders(headers) {
+  return [...headers.entries()]
+    .filter(([name]) => name.toLowerCase().startsWith("x-oss-"))
+    .map(([name, value]) => [name.toLowerCase(), value.trim().replace(/\s+/g, " ")])
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, value]) => `${name}:${value}\n`)
+    .join("");
+}
+
+async function signedOssRequest(c, ossKey, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const subresource = String(options.subresource || "");
+  const headers = new Headers(options.headers || {});
+  if (!headers.has("Date")) headers.set("Date", new Date().toUTCString());
+  const resource = `/${c.BUCKET}/${ossKey}${subresource ? `?${subresource}` : ""}`;
+  const stringToSign =
+    `${method}\n` +
+    `${headers.get("Content-MD5") || ""}\n` +
+    `${headers.get("Content-Type") || ""}\n` +
+    `${headers.get("Date")}\n` +
+    canonicalizeOssHeaders(headers) +
+    resource;
+  const signature = await hmacSha1Base64(c.AKS, stringToSign);
+  headers.set("Authorization", `OSS ${c.AKID}:${signature}`);
+  const suffix = subresource ? `?${subresource}` : "";
+  return fetch(`${c.OSS_HOST}/${encodeOssKey(ossKey)}${suffix}`, {
+    method,
+    headers,
+    ...(options.body === undefined ? {} : { body: options.body }),
+  });
+}
+
+async function presignMultipartPart(c, payload, partNumber, expiresAt) {
+  const subresource = `partNumber=${partNumber}&uploadId=${payload.uploadId}`;
+  const resource = `/${c.BUCKET}/${payload.ossKey}?${subresource}`;
+  const signature = await hmacSha1Base64(
+    c.AKS,
+    `PUT\n\n\n${expiresAt}\n${resource}`,
+  );
+  const url = new URL(`${c.PUBLIC_UPLOAD_HOST}/${encodeOssKey(payload.ossKey)}`);
+  url.searchParams.set("partNumber", String(partNumber));
+  url.searchParams.set("uploadId", payload.uploadId);
+  url.searchParams.set("OSSAccessKeyId", c.AKID);
+  url.searchParams.set("Expires", String(expiresAt));
+  url.searchParams.set("Signature", signature);
+  return url.toString();
+}
+
 function sekaiPublicPath(kind, uuid) {
   return `/${kind === "sticker" ? "stickers" : kind === "image" ? "images" : "files"}/${uuid}`;
 }
@@ -1229,6 +1350,264 @@ async function completeSekaiV2Upload(req, c, ctx) {
     ...(payload.w ? { w: payload.w } : {}),
     ...(payload.h ? { h: payload.h } : {}),
   }, { "Cache-Control": "no-store" });
+}
+
+function validMultipartPayload(c, payload) {
+  if (
+    !payload ||
+    payload.v !== 3 ||
+    payload.mode !== "multipart" ||
+    !UUID_RE.test(payload.uuid) ||
+    !/^[A-Za-z0-9_-]{16,256}$/.test(String(payload.uploadId || "")) ||
+    !Number.isSafeInteger(payload.size) ||
+    payload.size <= 0 ||
+    payload.size > MAX_UPLOAD_BYTES ||
+    payload.partSize !== MULTIPART_PART_SIZE ||
+    payload.partCount !== Math.ceil(payload.size / payload.partSize) ||
+    payload.partCount < 1 ||
+    payload.partCount > 10000
+  ) {
+    return false;
+  }
+  return payload.ossKey === `${c.PREFIX}/sekai/${payload.uuid}`;
+}
+
+function multipartResult(payload) {
+  const sizeKb = Math.round((payload.size / 1024) * 10) / 10;
+  return ok({
+    uuid: payload.uuid,
+    key: payload.uuid,
+    type: payload.type,
+    size: sizeKb,
+    size_bytes: payload.size,
+    name: payload.name,
+    kind: payload.kind,
+    url: sekaiPublicPath(payload.kind, payload.uuid),
+    ...(payload.w ? { w: payload.w } : {}),
+    ...(payload.h ? { h: payload.h } : {}),
+  }, { "Cache-Control": "no-store" });
+}
+
+async function initSekaiV2MultipartUpload(req, c, env) {
+  if (!(c.AKS && c.PUBLIC_UPLOAD_HOST && c.UPLOAD_TOKEN_SECRET)) {
+    return fail(501, "Direct upload is not configured");
+  }
+  const input = await readJson(req);
+  if (!input || typeof input !== "object") return fail(400, "Invalid JSON body");
+
+  const rawName = String(input.name || "").trim();
+  const contentType = String(input.type || "application/octet-stream").trim();
+  const fileSize = Number(input.size);
+  if (!rawName || rawName.length > 512 || /\.\.|\/\/|[\x00-\x1f]/.test(rawName)) {
+    return fail(400, "Invalid file name");
+  }
+  if (!contentType || contentType.length > 255 || /[\r\n]/.test(contentType)) {
+    return fail(400, "Invalid content type");
+  }
+  if (!Number.isSafeInteger(fileSize) || fileSize <= 0) {
+    return fail(400, "Invalid size");
+  }
+  if (fileSize > MAX_UPLOAD_BYTES) return fail(413, "Payload Too Large");
+  if (c.MULTIPART_REQUIRE_AUTH) {
+    if (!(await authenticate(req, env))) {
+      return fail(401, "SEKAI Pass required for multipart uploads");
+    }
+  } else {
+    const sizeErr = await authorizeUploadSize(req, env, fileSize);
+    if (sizeErr) return sizeErr;
+  }
+
+  const uuid = crypto.randomUUID();
+  const kind = inferKind(contentType, input.kind);
+  const ossKey = `${c.PREFIX}/sekai/${uuid}`;
+  const display = sanitize(rawName);
+  let w = Number(input.w);
+  let h = Number(input.h);
+  if (!Number.isInteger(w) || w <= 0) w = undefined;
+  if (!Number.isInteger(h) || h <= 0) h = undefined;
+  const created = Math.floor(Date.now() / 1000);
+  const objectMetadata = buildDirectObjectMetadata({ name: rawName, kind, created, w, h });
+  const initiate = await signedOssRequest(c, ossKey, {
+    method: "POST",
+    subresource: "uploads",
+    headers: {
+      "Content-Type": contentType,
+      "Content-Disposition": buildContentDisposition(display),
+      "x-oss-forbid-overwrite": "true",
+      ...objectMetadata,
+    },
+  });
+  const initiateBody = await initiate.text();
+  if (!initiate.ok) {
+    console.error(JSON.stringify({ message: "OSS multipart init failed", status: initiate.status }));
+    return fail(502, "Could not initialize multipart upload");
+  }
+  const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(initiateBody)?.[1] || "";
+  if (!/^[A-Za-z0-9_-]{16,256}$/.test(uploadId)) {
+    return fail(502, "Invalid multipart response from object storage");
+  }
+
+  const expiresAt = Math.floor(Date.now() / 1000) + DIRECT_UPLOAD_TTL_SECONDS;
+  const partCount = Math.ceil(fileSize / MULTIPART_PART_SIZE);
+  const token = await createUploadToken(c, {
+    v: 3,
+    mode: "multipart",
+    exp: expiresAt,
+    uuid,
+    kind,
+    type: contentType,
+    name: rawName,
+    size: fileSize,
+    ext: extOf(rawName),
+    ossKey,
+    uploadId,
+    partSize: MULTIPART_PART_SIZE,
+    partCount,
+    created,
+    ...(w ? { w } : {}),
+    ...(h ? { h } : {}),
+  });
+
+  return ok({
+    uuid,
+    key: uuid,
+    url: sekaiPublicPath(kind, uuid),
+    part_size: MULTIPART_PART_SIZE,
+    part_count: partCount,
+    expires_at: new Date(expiresAt * 1000).toISOString(),
+    multipart_token: token,
+  }, { "Cache-Control": "no-store" });
+}
+
+async function signSekaiV2MultipartParts(req, c) {
+  if (!(c.AKS && c.PUBLIC_UPLOAD_HOST && c.UPLOAD_TOKEN_SECRET)) {
+    return fail(501, "Direct upload is not configured");
+  }
+  const input = await readJson(req);
+  const payload = input && await verifyUploadToken(c, input.token);
+  if (!validMultipartPayload(c, payload)) {
+    return fail(400, "Invalid or expired multipart token");
+  }
+  if (
+    !Array.isArray(input.part_numbers) ||
+    input.part_numbers.length < 1 ||
+    input.part_numbers.length > MULTIPART_SIGN_BATCH_MAX
+  ) {
+    return fail(400, `part_numbers must contain 1-${MULTIPART_SIGN_BATCH_MAX} entries`);
+  }
+  const partNumbers = [...new Set(input.part_numbers)];
+  if (
+    partNumbers.length !== input.part_numbers.length ||
+    partNumbers.some((number) => !Number.isInteger(number) || number < 1 || number > payload.partCount)
+  ) {
+    return fail(400, "Invalid part number");
+  }
+
+  const expiresAt = Math.min(
+    payload.exp,
+    Math.floor(Date.now() / 1000) + MULTIPART_PART_URL_TTL_SECONDS,
+  );
+  const parts = await Promise.all(partNumbers.map(async (partNumber) => ({
+    part_number: partNumber,
+    size: partNumber === payload.partCount
+      ? payload.size - payload.partSize * (payload.partCount - 1)
+      : payload.partSize,
+    upload: {
+      method: "PUT",
+      url: await presignMultipartPart(c, payload, partNumber, expiresAt),
+      expires_at: new Date(expiresAt * 1000).toISOString(),
+    },
+  })));
+  return ok({ parts }, { "Cache-Control": "no-store" });
+}
+
+function normalizeMultipartParts(inputParts, expectedCount) {
+  if (!Array.isArray(inputParts) || inputParts.length !== expectedCount) return null;
+  const parts = inputParts.map((part) => {
+    const partNumber = Number(part && part.part_number);
+    const rawEtag = String(part && part.etag || "").trim();
+    const match = /^\"?([0-9a-fA-F]{32})\"?$/.exec(rawEtag);
+    return match ? { partNumber, etag: `\"${match[1].toUpperCase()}\"` } : null;
+  });
+  if (parts.some((part) => !part)) return null;
+  parts.sort((a, b) => a.partNumber - b.partNumber);
+  if (parts.some((part, index) => part.partNumber !== index + 1)) return null;
+  return parts;
+}
+
+async function verifyCompletedMultipartObject(c, payload) {
+  const head = await headObjectSigned(c, payload.ossKey);
+  if (!head.ok) {
+    await drain(head);
+    return false;
+  }
+  const storedSize = Number(head.headers.get("Content-Length"));
+  const storedType = head.headers.get("Content-Type") || "";
+  const metadata = metaFromObjectHeaders(payload.uuid, payload.ossKey, head.headers);
+  await drain(head);
+  return (
+    storedSize === payload.size &&
+    (!storedType || storedType === payload.type) &&
+    !!metadata &&
+    metadata.name === payload.name &&
+    metadata.kind === payload.kind &&
+    metadata.created === new Date(payload.created * 1000).toISOString() &&
+    (payload.w || undefined) === metadata.w &&
+    (payload.h || undefined) === metadata.h
+  );
+}
+
+async function completeSekaiV2MultipartUpload(req, c) {
+  if (!(c.AKS && c.UPLOAD_TOKEN_SECRET)) return fail(501, "Direct upload is not configured");
+  const input = await readJson(req, 64 * 1024);
+  const payload = input && await verifyUploadToken(c, input.token);
+  if (!validMultipartPayload(c, payload)) {
+    return fail(400, "Invalid or expired multipart token");
+  }
+  const parts = normalizeMultipartParts(input.parts, payload.partCount);
+  if (!parts) return fail(400, "Invalid multipart part list");
+
+  const completeBody =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+    "<CompleteMultipartUpload>" +
+    parts.map((part) =>
+      `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>${part.etag}</ETag></Part>`
+    ).join("") +
+    "</CompleteMultipartUpload>";
+  const complete = await signedOssRequest(c, payload.ossKey, {
+    method: "POST",
+    subresource: `uploadId=${payload.uploadId}`,
+    headers: { "Content-Type": "application/xml" },
+    body: completeBody,
+  });
+  await drain(complete);
+  if (!complete.ok) {
+    return fail(complete.status === 404 ? 409 : 502, "Could not complete multipart upload");
+  }
+  if (!(await verifyCompletedMultipartObject(c, payload))) {
+    const cleanup = await signedOssRequest(c, payload.ossKey, { method: "DELETE" });
+    await drain(cleanup);
+    return fail(409, "Completed object does not match the upload declaration");
+  }
+  return multipartResult(payload);
+}
+
+async function abortSekaiV2MultipartUpload(req, c) {
+  if (!(c.AKS && c.UPLOAD_TOKEN_SECRET)) return fail(501, "Direct upload is not configured");
+  const input = await readJson(req);
+  const payload = input && await verifyUploadToken(c, input.token);
+  if (!validMultipartPayload(c, payload)) {
+    return fail(400, "Invalid or expired multipart token");
+  }
+  const aborted = await signedOssRequest(c, payload.ossKey, {
+    method: "DELETE",
+    subresource: `uploadId=${payload.uploadId}`,
+  });
+  await drain(aborted);
+  if (!(aborted.ok || aborted.status === 404)) {
+    return fail(502, "Could not abort multipart upload");
+  }
+  return ok({ aborted: true }, { "Cache-Control": "no-store" });
 }
 
 /**

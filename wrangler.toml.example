@@ -18,6 +18,8 @@ OSS_UPLOAD_HOST = ""
 PUBLIC_UPLOAD_HOST = "https://upload.example.com"
 # Direct uploads store metadata on the object by default. Set to "0" for legacy JSON sidecars.
 # DIRECT_UPLOAD_OBJECT_METADATA = "0"
+# Multipart initialization requires SEKAI Pass by default. Set to "0" only for isolated testing.
+# MULTIPART_REQUIRE_AUTH = "0"
 # Optional: npx wrangler secret put UPLOAD_TOKEN_SECRET -c wrangler.local.toml
 # If omitted, direct-upload completion tokens use OSS_AKS as the HMAC secret.
 # auto | put | post  (when OSS_AKS is set)
