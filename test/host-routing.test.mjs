@@ -130,5 +130,15 @@ describe('hostname role separation', () => {
     assert.equal(result.upload.url, 'https://upload.example.com/');
     assert.equal(result.upload.fields.key, 'AttachFiles/public/gallery/manifest.json');
     assert.equal(result.upload.fields['Content-Type'], 'application/json');
+    assert.equal(
+      result.upload.fields['Cache-Control'],
+      'no-cache, no-store, must-revalidate',
+    );
+    const policy = JSON.parse(
+      Buffer.from(result.upload.fields.policy, 'base64').toString('utf8'),
+    );
+    assert.ok(policy.conditions.some((condition) =>
+      condition['Cache-Control'] === 'no-cache, no-store, must-revalidate'
+    ));
   });
 });

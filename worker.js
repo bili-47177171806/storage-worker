@@ -1124,7 +1124,7 @@ async function signDirectUploadPolicy(
   fileSize,
   contentType,
   cdValue,
-  objectMetadata = {},
+  extraFields = {},
 ) {
   const expiresAt = Math.floor(Date.now() / 1000) + DIRECT_UPLOAD_TTL_SECONDS;
   const policyObj = {
@@ -1134,7 +1134,7 @@ async function signDirectUploadPolicy(
       ["content-length-range", fileSize, fileSize],
       { "Content-Type": contentType },
       { "Content-Disposition": cdValue },
-      ...Object.entries(objectMetadata).map(([name, value]) => ({ [name]: value })),
+      ...Object.entries(extraFields).map(([name, value]) => ({ [name]: value })),
     ],
   };
   const policy = bufToBase64(new TextEncoder().encode(JSON.stringify(policyObj)));
@@ -1369,12 +1369,14 @@ async function initGalleryManifestUpload(req, c) {
   const ossKey = `${c.PREFIX}/public/gallery/manifest.json`;
   const contentType = "application/json";
   const cdValue = 'inline; filename="manifest.json"';
+  const cacheControl = "no-cache, no-store, must-revalidate";
   const direct = await signDirectUploadPolicy(
     c,
     ossKey,
     fileSize,
     contentType,
     cdValue,
+    { "Cache-Control": cacheControl },
   );
   return ok({
     upload: {
@@ -1389,6 +1391,7 @@ async function initGalleryManifestUpload(req, c) {
         success_action_status: "204",
         "Content-Type": contentType,
         "Content-Disposition": cdValue,
+        "Cache-Control": cacheControl,
       },
     },
   }, { "Cache-Control": "no-store" });
