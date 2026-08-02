@@ -70,9 +70,12 @@ GET {SIGN_BACKEND}/File/GetOssPolicy2Signature?userid={id}&bucket={bucket}
 
 | | |
 |--|--|
-| HTML | `GET /` |
-| JSON | `GET /?format=json` or `Accept: application/json` |
-| Markdown | `GET /?format=md` or `Accept: text/markdown` |
+| HTML | `GET /` with `Accept: text/html` |
+| Plain text | `GET /` without an `Accept` header |
+| JSON | `GET /?json` or `Accept: application/json` |
+| Markdown | `GET /?markdown`, `GET /?md`, or `Accept: text/markdown` |
+
+The legacy `?format=json`, `?format=md`, and `?format=markdown` forms remain supported.
 
 ### SEKAI v2
 
