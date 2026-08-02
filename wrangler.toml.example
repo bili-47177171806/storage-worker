@@ -20,8 +20,8 @@ OSS_UPLOAD_HOST = ""
 PUBLIC_UPLOAD_HOST = "https://upload.example.com"
 # Direct uploads store metadata on the object by default. Set to "0" for legacy JSON sidecars.
 # DIRECT_UPLOAD_OBJECT_METADATA = "0"
-# Multipart initialization requires SEKAI Pass by default. Set to "0" only for isolated testing.
-# MULTIPART_REQUIRE_AUTH = "0"
+# Multipart initialization requires SEKAI Pass. Set to "0" only for isolated testing.
+MULTIPART_REQUIRE_AUTH = "1"
 # Per-object STS lets clients sign their own OSS multipart requests. Keep parent keys in Wrangler secrets.
 MULTIPART_STS_ENABLED = "1"
 MULTIPART_RECOMMENDED_CONCURRENCY = "2"
