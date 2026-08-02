@@ -42,8 +42,10 @@ const OSS_MULTIPART_MAX_PARTS = 10000;
 const OSS_MULTIPART_MAX_OBJECT_BYTES = OSS_MULTIPART_MAX_PART_BYTES * OSS_MULTIPART_MAX_PARTS;
 /** Client default; grows only when needed to stay within the OSS part-count limit. */
 const MULTIPART_DEFAULT_PART_SIZE = 10 * MIB;
+const MULTIPART_RECOMMENDED_CONCURRENCY = 2;
 const MULTIPART_SIGN_BATCH_MAX = 20;
 const MULTIPART_PART_URL_TTL_SECONDS = 15 * 60;
+const STS_DEFAULT_DURATION_SECONDS = 3600;
 /** Extensions probed when v2 meta sidecar is missing (common first). */
 const SEKAI_PROBE_EXTS = [
   "",
@@ -111,6 +113,13 @@ function cfg(env) {
   const UPLOAD_HOST = rawUpload.replace(/\/$/, "") || OSS_HOST;
   const PUBLIC_UPLOAD_HOST = String(e.PUBLIC_UPLOAD_HOST || "").trim().replace(/\/$/, "");
   const UPLOAD_TOKEN_SECRET = String(e.UPLOAD_TOKEN_SECRET || "").trim() || AKS;
+  const STS_AKID = String(e.STS_AKID || "").trim();
+  const STS_AKS = String(e.STS_AKS || "").trim();
+  const STS_ENDPOINT = String(e.STS_ENDPOINT || "")
+    .trim()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/$/, "");
+  const STS_ROLE_ARN = String(e.STS_ROLE_ARN || "").trim();
   // Prefer PutObject when we have SK (simpler stream, no multipart). Can force PostObject with OSS_PUT_MODE=post
   const putMode = String(e.OSS_PUT_MODE || "auto").trim().toLowerCase();
   const byteLimit = (value, fallback) => {
@@ -128,6 +137,10 @@ function cfg(env) {
     UPLOAD_HOST,
     PUBLIC_UPLOAD_HOST,
     UPLOAD_TOKEN_SECRET,
+    STS_AKID,
+    STS_AKS,
+    STS_ENDPOINT,
+    STS_ROLE_ARN,
     PUT_MODE: putMode, // auto | put | post
     CHUNK_SIZE,
     WORKER_UPLOAD_MAX_BYTES: byteLimit(e.WORKER_UPLOAD_MAX_BYTES, MAX_UPLOAD_BYTES),
@@ -151,6 +164,18 @@ function cfg(env) {
       String(e.DIRECT_UPLOAD_OBJECT_METADATA ?? "1").trim() !== "0",
     MULTIPART_REQUIRE_AUTH:
       String(e.MULTIPART_REQUIRE_AUTH ?? "1").trim() !== "0",
+    MULTIPART_STS_ENABLED: String(e.MULTIPART_STS_ENABLED || "").trim() === "1",
+    MULTIPART_RECOMMENDED_CONCURRENCY: Math.min(
+      Math.max(byteLimit(
+        e.MULTIPART_RECOMMENDED_CONCURRENCY,
+        MULTIPART_RECOMMENDED_CONCURRENCY,
+      ), 1),
+      32,
+    ),
+    STS_DURATION_SECONDS: Math.min(
+      Math.max(byteLimit(e.STS_DURATION_SECONDS, STS_DEFAULT_DURATION_SECONDS), 900),
+      43200,
+    ),
     DELETE_ENABLED: String(e.DELETE_ENABLED || "").trim() === "1",
   };
 }
@@ -237,6 +262,9 @@ export default {
       }
       if (path === "v2/upload/multipart/parts" && req.method === "POST") {
         return await signSekaiV2MultipartParts(req, c);
+      }
+      if (path === "v2/upload/multipart/credentials" && req.method === "POST") {
+        return await issueSekaiV2MultipartCredentials(req, c);
       }
       if (path === "v2/upload/multipart/complete" && req.method === "POST") {
         return await completeSekaiV2MultipartUpload(req, c);
@@ -376,6 +404,8 @@ function apiIndex(req, url, c) {
       multipart_upload: {
         auth: "SEKAI Pass Bearer token is required to initialize multipart uploads",
         default_part_size: MULTIPART_DEFAULT_PART_SIZE,
+        recommended_concurrency: c.MULTIPART_RECOMMENDED_CONCURRENCY,
+        client_sts_enabled: multipartStsConfigured(c),
         min_nonfinal_part_bytes: OSS_MULTIPART_MIN_PART_BYTES,
         max_part_bytes: multipart.maxPartBytes,
         max_parts: OSS_MULTIPART_MAX_PARTS,
@@ -386,7 +416,13 @@ function apiIndex(req, url, c) {
             method: "POST",
             path: "/v2/upload/multipart/init",
             body: { name: "large.bin", type: "application/octet-stream", size: 12582912, kind: "file" },
-            note: "Initializes OSS multipart upload and returns multipart_token, part_size, and part_count.",
+            note: "Initializes OSS multipart upload and returns multipart_token, part_size, part_count, and per-object STS credentials when enabled.",
+          },
+          {
+            method: "POST",
+            path: "/v2/upload/multipart/credentials",
+            body: { token: "multipart_token" },
+            note: "Refreshes the per-object STS credentials before they expire.",
           },
           {
             method: "POST",
@@ -398,7 +434,7 @@ function apiIndex(req, url, c) {
             method: "POST",
             path: "/v2/upload/multipart/complete",
             body: { token: "multipart_token", parts: [{ part_number: 1, etag: "OSS ETag" }] },
-            note: "Completes OSS multipart upload, verifies object size and metadata, and returns the normal v2 response.",
+            note: "Compatibility completion path. STS clients complete directly, then call this endpoint with { token, completed: true } for verification.",
           },
         ],
         abort: {
@@ -406,7 +442,7 @@ function apiIndex(req, url, c) {
           path: "/v2/upload/multipart/abort",
           body: { token: "multipart_token" },
         },
-        gateway_requirements: "Allow PUT and expose ETag to browser clients.",
+        gateway_requirements: "Allow PUT and expose ETag to browser clients. STS clients use OSS V1 presigned query URLs, including security-token in the signed query.",
       },
       upload: {
         method: "PUT",
@@ -588,9 +624,10 @@ function renderApiMarkdown(doc, origin) {
   lines.push("");
   lines.push("1. `POST /v2/upload/multipart/init` with `{ name, type, size, kind?, w?, h? }`.");
   lines.push("2. Split the file using the returned `part_size` exactly (the final part may be smaller).");
-  lines.push(`3. Batch up to ${doc.sekaiv2.multipart_upload.max_signed_parts_per_request} part numbers in POST /v2/upload/multipart/parts with the returned multipart_token, then PUT each part to its returned URL and record ETag.`);
-  lines.push("4. `POST /v2/upload/multipart/complete` with `{ token: multipart_token, parts: [{ part_number, etag }] }`.");
-  lines.push("5. Use `POST /v2/upload/multipart/abort` with `{ token: multipart_token }` to abandon an unfinished upload.");
+  lines.push(`3. When \`multipart_sts\` is returned, sign OSS multipart requests locally with those short-lived, single-object credentials and send every part to its \`endpoint\`; use ${doc.sekaiv2.multipart_upload.recommended_concurrency} concurrent parts by default.`);
+  lines.push(`4. Refresh expiring STS credentials with \`POST /v2/upload/multipart/credentials\` and \`{ token: multipart_token }\`. The compatibility fallback is batching up to ${doc.sekaiv2.multipart_upload.max_signed_parts_per_request} part numbers through \`/v2/upload/multipart/parts\`.`);
+  lines.push("5. STS clients call OSS CompleteMultipartUpload directly, then `POST /v2/upload/multipart/complete` with `{ token: multipart_token, completed: true }` for verification. The legacy completion body with ETags remains supported.");
+  lines.push("6. Use `POST /v2/upload/multipart/abort` with `{ token: multipart_token }` to abandon an unfinished upload.");
   lines.push("");
   lines.push(`Parts default to ${doc.sekaiv2.multipart_upload.default_part_size} bytes and grow only for very large files. The gateway permits at most ${doc.sekaiv2.multipart_upload.max_part_bytes} bytes per part, ${doc.sekaiv2.multipart_upload.max_parts} parts, and ${doc.sekaiv2.multipart_upload.max_file_bytes} bytes per completed object.`);
   lines.push("");
@@ -849,10 +886,10 @@ function renderApiHtml(doc, origin) {
     <h3><span class="method put">POST</span>Multipart direct upload</h3>
     <ol>
       <li><code>POST /v2/upload/multipart/init</code> with JSON <code>{ name, type, size, kind?, w?, h? }</code> and a SEKAI Pass Bearer token.</li>
-      <li>Split using the returned <code>part_size</code>, request PUT URLs in batches from <code>POST /v2/upload/multipart/parts</code>, then record every upload response <code>ETag</code>.</li>
-      <li><code>POST /v2/upload/multipart/complete</code> with the token and <code>{ part_number, etag }</code> entries. Use <code>/multipart/abort</code> to abandon an unfinished upload.</li>
+      <li>When <code>multipart_sts</code> is returned, sign all OSS multipart requests locally with those short-lived single-object credentials and send parts to its endpoint. Otherwise, request compatibility PUT URLs from <code>/multipart/parts</code>.</li>
+      <li>STS clients complete directly on OSS, then call <code>/multipart/complete</code> with <code>{ token, completed: true }</code> for verification. Use <code>/multipart/credentials</code> to refresh expiring STS credentials.</li>
     </ol>
-    <p style="color:var(--muted);font-size:0.9rem">Default part size: <code>${esc(doc.sekaiv2.multipart_upload.default_part_size)}</code> bytes. Maximum part: <code>${esc(doc.sekaiv2.multipart_upload.max_part_bytes)}</code> bytes; maximum parts: <code>${esc(doc.sekaiv2.multipart_upload.max_parts)}</code>; maximum object: <code>${esc(doc.sekaiv2.multipart_upload.max_file_bytes)}</code> bytes.</p>
+    <p style="color:var(--muted);font-size:0.9rem">Default part size: <code>${esc(doc.sekaiv2.multipart_upload.default_part_size)}</code> bytes; recommended concurrency: <code>${esc(doc.sekaiv2.multipart_upload.recommended_concurrency)}</code>. Maximum part: <code>${esc(doc.sekaiv2.multipart_upload.max_part_bytes)}</code> bytes; maximum parts: <code>${esc(doc.sekaiv2.multipart_upload.max_parts)}</code>; maximum object: <code>${esc(doc.sekaiv2.multipart_upload.max_file_bytes)}</code> bytes.</p>
     <p style="color:var(--muted);font-size:0.9rem">The upload gateway must allow PUT and expose <code>ETag</code> to browser clients.</p>
 
     <h3>Compatibility upload</h3>
@@ -1458,6 +1495,123 @@ function multipartResult(payload) {
   }, { "Cache-Control": "no-store" });
 }
 
+function multipartStsConfigured(c) {
+  return !!(
+    c.MULTIPART_STS_ENABLED &&
+    c.STS_AKID &&
+    c.STS_AKS &&
+    c.STS_ENDPOINT &&
+    c.STS_ROLE_ARN &&
+    c.PUBLIC_UPLOAD_HOST
+  );
+}
+
+function aliyunRpcEncode(value) {
+  return encodeURIComponent(String(value))
+    .replace(/!/g, "%21")
+    .replace(/'/g, "%27")
+    .replace(/\(/g, "%28")
+    .replace(/\)/g, "%29")
+    .replace(/\*/g, "%2A");
+}
+
+async function assumeMultipartSts(c, ossKey) {
+  const accountId = /^acs:ram::(\d+):role\/[A-Za-z0-9_+=,.@-]+$/.exec(c.STS_ROLE_ARN)?.[1];
+  if (!accountId) throw new Error("invalid STS role ARN");
+
+  const policy = JSON.stringify({
+    Version: "1",
+    Statement: [{
+      Effect: "Allow",
+      Action: [
+        "oss:PutObject",
+        "oss:AbortMultipartUpload",
+        "oss:ListParts",
+      ],
+      Resource: [`acs:oss:*:${accountId}:${c.BUCKET}/${ossKey}`],
+    }],
+  });
+  const params = {
+    AccessKeyId: c.STS_AKID,
+    Action: "AssumeRole",
+    DurationSeconds: String(c.STS_DURATION_SECONDS),
+    Format: "JSON",
+    Policy: policy,
+    RoleArn: c.STS_ROLE_ARN,
+    RoleSessionName: `multipart-${crypto.randomUUID()}`,
+    SignatureMethod: "HMAC-SHA1",
+    SignatureNonce: crypto.randomUUID(),
+    SignatureVersion: "1.0",
+    Timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+    Version: "2015-04-01",
+  };
+  const canonicalQuery = Object.entries(params)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, value]) => `${aliyunRpcEncode(name)}=${aliyunRpcEncode(value)}`)
+    .join("&");
+  const stringToSign = `GET&${aliyunRpcEncode("/")}&${aliyunRpcEncode(canonicalQuery)}`;
+  const signature = await hmacSha1Base64(c.STS_AKS, stringToSign);
+  const response = await fetch(
+    `https://${c.STS_ENDPOINT}/?${canonicalQuery}&Signature=${aliyunRpcEncode(signature)}`,
+    { signal: AbortSignal.timeout(15000) },
+  );
+  const body = await response.text();
+  let result;
+  try {
+    result = JSON.parse(body);
+  } catch {
+    throw new Error(`STS returned non-JSON status ${response.status}`);
+  }
+  const credentials = result && result.Credentials;
+  if (
+    !response.ok ||
+    !credentials ||
+    !credentials.AccessKeyId ||
+    !credentials.AccessKeySecret ||
+    !credentials.SecurityToken ||
+    !credentials.Expiration
+  ) {
+    throw new Error(`STS AssumeRole failed (${response.status} ${result?.Code || "Unknown"})`);
+  }
+  return credentials;
+}
+
+function multipartStsResponse(c, payload, credentials) {
+  return {
+    version: "oss-v1-presigned-url",
+    endpoint: c.PUBLIC_UPLOAD_HOST,
+    bucket: c.BUCKET,
+    object_key: payload.ossKey,
+    upload_id: payload.uploadId,
+    access_key_id: credentials.AccessKeyId,
+    access_key_secret: credentials.AccessKeySecret,
+    security_token: credentials.SecurityToken,
+    expires_at: credentials.Expiration,
+  };
+}
+
+async function issueSekaiV2MultipartCredentials(req, c) {
+  if (!c.MULTIPART_STS_ENABLED) return fail(404);
+  if (!multipartStsConfigured(c)) return fail(501, "Multipart STS is not configured");
+  const input = await readJson(req);
+  const payload = input && await verifyUploadToken(c, input.token);
+  if (!validMultipartPayload(c, payload)) {
+    return fail(400, "Invalid or expired multipart token");
+  }
+  try {
+    const credentials = await assumeMultipartSts(c, payload.ossKey);
+    return ok({ multipart_sts: multipartStsResponse(c, payload, credentials) }, {
+      "Cache-Control": "no-store",
+    });
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "OSS multipart STS issue failed",
+      error: error instanceof Error ? error.message : "unknown",
+    }));
+    return fail(502, "Could not issue multipart credentials");
+  }
+}
+
 async function initSekaiV2MultipartUpload(req, c, env) {
   if (!(c.AKS && c.PUBLIC_UPLOAD_HOST && c.UPLOAD_TOKEN_SECRET)) {
     return fail(501, "Direct upload is not configured");
@@ -1497,6 +1651,19 @@ async function initSekaiV2MultipartUpload(req, c, env) {
   if (!Number.isInteger(h) || h <= 0) h = undefined;
   const created = Math.floor(Date.now() / 1000);
   const objectMetadata = buildDirectObjectMetadata({ name: rawName, kind, created, w, h });
+  let stsCredentials = null;
+  if (c.MULTIPART_STS_ENABLED) {
+    if (!multipartStsConfigured(c)) return fail(501, "Multipart STS is not configured");
+    try {
+      stsCredentials = await assumeMultipartSts(c, ossKey);
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "OSS multipart STS issue failed",
+        error: error instanceof Error ? error.message : "unknown",
+      }));
+      return fail(502, "Could not issue multipart credentials");
+    }
+  }
   const initiate = await signedOssRequest(c, ossKey, {
     method: "POST",
     subresource: "uploads",
@@ -1544,8 +1711,15 @@ async function initSekaiV2MultipartUpload(req, c, env) {
     url: sekaiPublicPath(kind, uuid),
     part_size: partSize,
     part_count: partCount,
+    recommended_concurrency: c.MULTIPART_RECOMMENDED_CONCURRENCY,
     expires_at: new Date(expiresAt * 1000).toISOString(),
     multipart_token: token,
+    ...(stsCredentials ? {
+      multipart_sts: multipartStsResponse(c, {
+        ossKey,
+        uploadId,
+      }, stsCredentials),
+    } : {}),
   }, { "Cache-Control": "no-store" });
 }
 
@@ -1633,6 +1807,12 @@ async function completeSekaiV2MultipartUpload(req, c) {
   const payload = input && await verifyUploadToken(c, input.token);
   if (!validMultipartPayload(c, payload)) {
     return fail(400, "Invalid or expired multipart token");
+  }
+  if (input.completed === true) {
+    if (!(await verifyCompletedMultipartObject(c, payload))) {
+      return fail(409, "Completed object does not match the upload declaration");
+    }
+    return multipartResult(payload);
   }
   const parts = normalizeMultipartParts(input.parts, payload.partCount);
   if (!parts) return fail(400, "Invalid multipart part list");

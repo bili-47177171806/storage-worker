@@ -24,6 +24,8 @@ cp wrangler.toml.example wrangler.local.toml
 # 2. AccessKey Id + Secret (Cloudflare secrets — never commit)
 npx wrangler secret put OSS_AKID -c wrangler.local.toml
 npx wrangler secret put OSS_AKS  -c wrangler.local.toml
+npx wrangler secret put STS_AKID -c wrangler.local.toml
+npx wrangler secret put STS_AKS  -c wrangler.local.toml
 
 # 3. Deploy
 npx wrangler deploy -c wrangler.local.toml
@@ -45,6 +47,11 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 | `UPLOAD_TOKEN_SECRET` | no | **secret** | Separate HMAC secret for completion tokens; falls back to `OSS_AKS` |
 | `DIRECT_UPLOAD_OBJECT_METADATA` | no | `[vars]` | Object Metadata is enabled by default; set to `0` to use legacy JSON sidecars |
 | `MULTIPART_REQUIRE_AUTH` | no | `[vars]` | `1` by default; requires SEKAI Pass for every Multipart initialization |
+| `MULTIPART_STS_ENABLED` | no | `[vars]` | Set to `1` to issue short-lived, single-object STS credentials to Multipart clients |
+| `MULTIPART_RECOMMENDED_CONCURRENCY` | no | `[vars]` | Client recommendation, default `2`; higher concurrency did not improve the measured upload-gateway throughput |
+| `STS_ENDPOINT` | with STS | `[vars]` | STS RPC endpoint, for example `sts.cn-qingdao.aliyuncs.com` |
+| `STS_ROLE_ARN` | with STS | `[vars]` | RAM role assumed for short-lived Multipart credentials |
+| `STS_AKID` / `STS_AKS` | with STS | **secret** | Parent RAM credentials used only to call `AssumeRole`; never returned to clients |
 | `WORKER_UPLOAD_MAX_BYTES` | no | `[vars]` | Body limit advertised/enforced by Worker upload endpoints; default keeps the legacy ~1 GB ceiling, but must not exceed the Cloudflare plan limit |
 | `DIRECT_UPLOAD_MAX_BYTES` | no | `[vars]` | Single signed upload limit; defaults to and cannot exceed the upload gateway's 800 MiB ceiling |
 | `MULTIPART_MAX_PART_BYTES` | no | `[vars]` | Multipart part ceiling; defaults to and cannot exceed 800 MiB (the tighter of OSS 5 GiB and the upload gateway) |
@@ -121,7 +128,9 @@ Multipart is intended for SEKAI Pass clients that need resumable parts. It uses 
 Object Metadata layout as normal direct upload, but requires a valid `Authorization: Bearer`
 token at initialization. The default part size is `10 MiB`; the server automatically increases
 it for files that would otherwise exceed OSS's 10,000-part limit. Clients must use the returned
-`part_size`; all parts except the final one must use that size.
+`part_size`; all parts except the final one must use that size. The measured default client
+concurrency is `2` because this upload path is bandwidth-capped; higher concurrency did not
+increase effective throughput.
 
 ```http
 POST /v2/upload/multipart/init
@@ -131,8 +140,32 @@ Content-Type: application/json
 {"name":"large.bin","type":"application/octet-stream","size":12582912,"kind":"file"}
 ```
 
-The response provides `multipart_token`, `part_size`, and `part_count`. Request short-lived
-PUT URLs in batches of up to 20 parts:
+With `MULTIPART_STS_ENABLED=1`, the response additionally provides `multipart_sts`: temporary
+credentials limited to this exact object, the existing `upload_id`, the upload-gateway endpoint,
+and the canonical Bucket/object key needed for OSS V1 signing. The client signs presigned URLs
+locally for Multipart `UploadPart`, `CompleteMultipartUpload`, `ListParts`, and
+`AbortMultipartUpload`, including `security-token` in the signed query string. Every part
+request goes directly to the upload gateway, without a Worker request per batch. Credentials
+expire after the STS duration; refresh them with:
+
+```http
+POST /v2/upload/multipart/credentials
+Content-Type: application/json
+
+{"token":"<multipart_token>"}
+```
+
+After direct OSS completion, ask the Worker only to verify the declared object and return the
+normal v2 response:
+
+```http
+POST /v2/upload/multipart/complete
+Content-Type: application/json
+
+{"token":"<multipart_token>","completed":true}
+```
+
+The older batch URL flow remains available for clients that do not support local STS signing:
 
 ```http
 POST /v2/upload/multipart/parts
@@ -153,6 +186,11 @@ Content-Type: application/json
 Use `POST /v2/upload/multipart/abort` with `{ "token": "<multipart_token>" }` to cancel an
 unfinished upload. The upload gateway must allow `PUT` and expose `ETag` through CORS; file
 bytes do not traverse the Worker.
+
+STS credentials are bearer credentials for one object, so `init` and `credentials` are always
+`Cache-Control: no-store`. Client-side OSS V1 signing needs the Bucket in this authenticated
+response; concealment is not the security boundary. The session policy is restricted to the
+exact object key and does not grant Bucket listing or read access.
 
 OSS permits 100 KiB-5 GiB non-final parts, at most 10,000 parts, and an object of about
 48.8 TiB. The upload gateway is tighter at 800 MiB per request, so this deployment permits

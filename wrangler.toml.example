@@ -2,6 +2,8 @@
 #   cp wrangler.toml.example wrangler.local.toml
 #   npx wrangler secret put OSS_AKID -c wrangler.local.toml
 #   npx wrangler secret put OSS_AKS  -c wrangler.local.toml
+#   npx wrangler secret put STS_AKID -c wrangler.local.toml
+#   npx wrangler secret put STS_AKS  -c wrangler.local.toml
 #   npx wrangler deploy -c wrangler.local.toml
 #
 # Never commit AccessKey Id/Secret or real production hostnames.
@@ -20,6 +22,11 @@ PUBLIC_UPLOAD_HOST = "https://upload.example.com"
 # DIRECT_UPLOAD_OBJECT_METADATA = "0"
 # Multipart initialization requires SEKAI Pass by default. Set to "0" only for isolated testing.
 # MULTIPART_REQUIRE_AUTH = "0"
+# Per-object STS lets clients sign their own OSS multipart requests. Keep parent keys in Wrangler secrets.
+MULTIPART_STS_ENABLED = "1"
+MULTIPART_RECOMMENDED_CONCURRENCY = "2"
+STS_ENDPOINT = "sts.cn-hangzhou.aliyuncs.com"
+STS_ROLE_ARN = "acs:ram::<account-id>:role/<oss-multipart-role>"
 # Match this to the Cloudflare plan's request-body limit for PUT /v2/upload and legacy PUT paths.
 # WORKER_UPLOAD_MAX_BYTES = "1048576000"
 # Dedicated upload gateway limits. Values above 800 MiB are clamped.
