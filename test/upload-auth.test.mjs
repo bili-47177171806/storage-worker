@@ -131,11 +131,11 @@ describe('四条上传路径都过 authorizeUploadSize', () => {
   });
 });
 
-describe('PostObject policy 用绝对硬顶（不缩成 512MiB）', () => {
-  test('content-length-range 仍是 MAX_UPLOAD_BYTES', () => {
-    const m = /signPolicyLocal\(c, userid\)[\s\S]*?content-length-range["']?,\s*0,\s*([A-Za-z_]+)/.exec(src);
+describe('PostObject policy 用 Worker body 端点限制', () => {
+  test('content-length-range 使用 c.WORKER_UPLOAD_MAX_BYTES', () => {
+    const m = /signPolicyLocal\(c, userid\)[\s\S]*?content-length-range["']?,\s*0,\s*c\.([A-Za-z_]+)/.exec(src);
     assert.ok(m, '找不到 content-length-range');
-    assert.equal(m[1], 'MAX_UPLOAD_BYTES', '登录用户 512MiB–1GB 会在 OSS 边界被拒');
+    assert.equal(m[1], 'WORKER_UPLOAD_MAX_BYTES');
   });
 });
 

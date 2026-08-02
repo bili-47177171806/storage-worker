@@ -14,6 +14,9 @@ const ENV = {
 };
 
 const UPLOAD_ID = 'uploadid_123456789';
+const MIB = 1024 * 1024;
+const EDGE_MAX_PART_BYTES = 800 * MIB;
+const MULTIPART_MAX_FILE_BYTES = EDGE_MAX_PART_BYTES * 10000;
 
 function request(path, body, extraHeaders = {}) {
   return new Request(`https://storage.example.com${path}`, {
@@ -79,6 +82,38 @@ describe('multipart direct upload', () => {
     assert.equal(initRequest.options.headers.get('x-oss-meta-sekai-width'), '320');
     assert.equal(initRequest.options.headers.get('x-oss-forbid-overwrite'), 'true');
     assert.match(initRequest.options.headers.get('Authorization'), /^OSS access-id:/);
+  });
+
+  test('accepts the 3.12 GiB live-test file with 320 default-size parts', async () => {
+    const fileSize = 3351970975;
+    const { response, result } = await createMultipartUpload({
+      name: 'live-replay.mp4',
+      type: 'video/mp4',
+      size: fileSize,
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(result.part_size, 10 * MIB);
+    assert.equal(result.part_count, Math.ceil(fileSize / (10 * MIB)));
+    assert.equal(result.part_count, 320);
+  });
+
+  test('grows part size for objects above the 10 MiB x 10,000 boundary', async () => {
+    const fileSize = 150 * 1024 * MIB;
+    const { response, result } = await createMultipartUpload({ size: fileSize });
+
+    assert.equal(response.status, 200);
+    assert.equal(result.part_size, 16 * MIB);
+    assert.ok(result.part_count <= 10000);
+  });
+
+  test('rejects objects above the gateway-part x OSS-part-count ceiling', async () => {
+    const { response, initRequest } = await createMultipartUpload({
+      size: MULTIPART_MAX_FILE_BYTES + 1,
+    });
+
+    assert.equal(response.status, 413);
+    assert.equal(initRequest, undefined);
   });
 
   test('issues short-lived PUT URLs only for declared multipart parts', async () => {
@@ -185,7 +220,7 @@ describe('multipart direct upload', () => {
     }
   });
 
-  test('aborts the OSS upload without exposing its upload ID to callers', async () => {
+  test('aborts the OSS upload using the signed multipart token', async () => {
     const { result } = await createMultipartUpload();
     const originalFetch = globalThis.fetch;
     let abortRequest;

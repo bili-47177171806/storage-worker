@@ -87,6 +87,19 @@ describe('direct upload init', () => {
     assert.equal(response.status, 401);
   });
 
+  test('rejects a single signed upload above the 800 MiB gateway limit', async () => {
+    const response = await worker.fetch(
+      jsonRequest('/v2/upload/init', {
+        name: 'too-large.bin',
+        type: 'application/octet-stream',
+        size: 800 * 1024 * 1024 + 1,
+      }),
+      ENV,
+      {},
+    );
+    assert.equal(response.status, 413);
+  });
+
   test('can explicitly roll back to the JSON sidecar layout', async () => {
     const response = await worker.fetch(
       jsonRequest('/v2/upload/init', {

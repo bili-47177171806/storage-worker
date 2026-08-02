@@ -30,18 +30,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { cfg } from '../worker.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const src = readFileSync(join(root, 'worker.js'), 'utf8');
-
-/** 从源码里抠出 cfg()，用真实实现算配置 —— 不手抄。 */
-function loadCfg() {
-  const m = /function cfg\(env\) \{[\s\S]*?\n\}/.exec(src);
-  assert.ok(m, '找不到 cfg()');
-  // cfg 里用到的常量
-  const chunk = /const CHUNK_SIZE = [^;]+;/.exec(src)?.[0] ?? 'const CHUNK_SIZE = 0;';
-  return new Function(`${chunk}\n${m[0]}\nreturn cfg;`)();
-}
 
 function loadDeleteAllowed() {
   const m = /function deleteAllowed\(c\) \{[\s\S]*?\n\}/.exec(src);
@@ -49,7 +41,6 @@ function loadDeleteAllowed() {
   return new Function(`${m[0]}\nreturn deleteAllowed;`)();
 }
 
-const cfg = loadCfg();
 const deleteAllowed = loadDeleteAllowed();
 
 const BASE_ENV = {

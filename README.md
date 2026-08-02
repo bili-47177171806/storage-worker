@@ -45,6 +45,9 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 | `UPLOAD_TOKEN_SECRET` | no | **secret** | Separate HMAC secret for completion tokens; falls back to `OSS_AKS` |
 | `DIRECT_UPLOAD_OBJECT_METADATA` | no | `[vars]` | Object Metadata is enabled by default; set to `0` to use legacy JSON sidecars |
 | `MULTIPART_REQUIRE_AUTH` | no | `[vars]` | `1` by default; requires SEKAI Pass for every Multipart initialization |
+| `WORKER_UPLOAD_MAX_BYTES` | no | `[vars]` | Body limit advertised/enforced by Worker upload endpoints; default keeps the legacy ~1 GB ceiling, but must not exceed the Cloudflare plan limit |
+| `DIRECT_UPLOAD_MAX_BYTES` | no | `[vars]` | Single signed upload limit; defaults to and cannot exceed the upload gateway's 800 MiB ceiling |
+| `MULTIPART_MAX_PART_BYTES` | no | `[vars]` | Multipart part ceiling; defaults to and cannot exceed 800 MiB (the tighter of OSS 5 GiB and the upload gateway) |
 | `OSS_PUT_MODE` | no | `[vars]` | `auto` (default) / `put` / `post` |
 | `SIGN_BACKEND` | no* | `[vars]` | Remote policy API if `OSS_AKS` unset |
 | `PUBLIC_STORAGE_HOST` | no | `[vars]` | Docs only |
@@ -57,6 +60,10 @@ Bind your public hostname(s) to this Worker in the Cloudflare dashboard.
 \*\* Required if Multipart is enabled with its default auth requirement, or if you allow uploads above the 512 MiB anonymous cap.
 
 **Preferred:** set `OSS_AKS` so the Worker signs PostObject policy (or PutObject) locally — no external signer RTT.
+
+Set `WORKER_UPLOAD_MAX_BYTES` to the actual Cloudflare request-body limit for the zone/account.
+Cloudflare may reject an oversized request before the Worker runs. The signed single-upload path
+uses the dedicated upload gateway instead and is capped at 800 MiB.
 
 **Legacy fallback:** without SK,
 
@@ -112,8 +119,9 @@ Content-Type: application/json
 
 Multipart is intended for SEKAI Pass clients that need resumable parts. It uses the same
 Object Metadata layout as normal direct upload, but requires a valid `Authorization: Bearer`
-token at initialization. The default part size is `10 MiB`; all parts except the final one
-must use that size.
+token at initialization. The default part size is `10 MiB`; the server automatically increases
+it for files that would otherwise exceed OSS's 10,000-part limit. Clients must use the returned
+`part_size`; all parts except the final one must use that size.
 
 ```http
 POST /v2/upload/multipart/init
@@ -145,6 +153,10 @@ Content-Type: application/json
 Use `POST /v2/upload/multipart/abort` with `{ "token": "<multipart_token>" }` to cancel an
 unfinished upload. The upload gateway must allow `PUT` and expose `ETag` through CORS; file
 bytes do not traverse the Worker.
+
+OSS permits 100 KiB-5 GiB non-final parts, at most 10,000 parts, and an object of about
+48.8 TiB. The upload gateway is tighter at 800 MiB per request, so this deployment permits
+at most 800 MiB per part and 8,388,608,000,000 bytes (about 7.63 TiB) per completed object.
 
 `PUT /v2/upload` remains supported for existing clients:
 

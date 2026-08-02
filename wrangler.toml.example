@@ -20,6 +20,11 @@ PUBLIC_UPLOAD_HOST = "https://upload.example.com"
 # DIRECT_UPLOAD_OBJECT_METADATA = "0"
 # Multipart initialization requires SEKAI Pass by default. Set to "0" only for isolated testing.
 # MULTIPART_REQUIRE_AUTH = "0"
+# Match this to the Cloudflare plan's request-body limit for PUT /v2/upload and legacy PUT paths.
+# WORKER_UPLOAD_MAX_BYTES = "1048576000"
+# Dedicated upload gateway limits. Values above 800 MiB are clamped.
+# DIRECT_UPLOAD_MAX_BYTES = "838860800"
+# MULTIPART_MAX_PART_BYTES = "838860800"
 # Optional: npx wrangler secret put UPLOAD_TOKEN_SECRET -c wrangler.local.toml
 # If omitted, direct-upload completion tokens use OSS_AKS as the HMAC secret.
 # auto | put | post  (when OSS_AKS is set)

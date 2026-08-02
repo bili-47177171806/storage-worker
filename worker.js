@@ -22,15 +22,26 @@ import { authenticate } from "@25-ji-code-de/sekai-worker-kit";
 const SAFE_USERIDS = new Set(["public", "shared", "open"]);
 
 /** Non-secret runtime knobs that are not environment-specific. */
+const KIB = 1024;
+const MIB = 1024 * KIB;
+const GIB = 1024 * MIB;
 const CHUNK_SIZE = 10 * 1024 * 1024;
 /** Anonymous ceiling, aligned with Cloudflare's 512 MB cache object limit. */
 const ANON_MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
-/** Absolute upload ceiling for SEKAI Pass users; retained for compatibility. */
+/** Default ceiling for request bodies that traverse the Worker; retained for compatibility. */
 const MAX_UPLOAD_BYTES = 1048576000;
+/** Dedicated upload gateway request ceiling. */
+const EDGE_UPLOAD_MAX_BYTES = 800 * MIB;
+const DIRECT_UPLOAD_MAX_BYTES = EDGE_UPLOAD_MAX_BYTES;
 /** Short-lived direct-upload form and completion token lifetime. */
 const DIRECT_UPLOAD_TTL_SECONDS = 2 * 60 * 60;
-/** Multipart uploads use fixed-size parts except for the final part. */
-const MULTIPART_PART_SIZE = 10 * 1024 * 1024;
+/** OSS Multipart protocol limits; the gateway's 800 MiB ceiling is the tighter part limit. */
+const OSS_MULTIPART_MIN_PART_BYTES = 100 * KIB;
+const OSS_MULTIPART_MAX_PART_BYTES = 5 * GIB;
+const OSS_MULTIPART_MAX_PARTS = 10000;
+const OSS_MULTIPART_MAX_OBJECT_BYTES = OSS_MULTIPART_MAX_PART_BYTES * OSS_MULTIPART_MAX_PARTS;
+/** Client default; grows only when needed to stay within the OSS part-count limit. */
+const MULTIPART_DEFAULT_PART_SIZE = 10 * MIB;
 const MULTIPART_SIGN_BATCH_MAX = 20;
 const MULTIPART_PART_URL_TTL_SECONDS = 15 * 60;
 /** Extensions probed when v2 meta sidecar is missing (common first). */
@@ -102,6 +113,10 @@ function cfg(env) {
   const UPLOAD_TOKEN_SECRET = String(e.UPLOAD_TOKEN_SECRET || "").trim() || AKS;
   // Prefer PutObject when we have SK (simpler stream, no multipart). Can force PostObject with OSS_PUT_MODE=post
   const putMode = String(e.OSS_PUT_MODE || "auto").trim().toLowerCase();
+  const byteLimit = (value, fallback) => {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+  };
   return {
     BUCKET,
     ENDPOINT,
@@ -115,6 +130,19 @@ function cfg(env) {
     UPLOAD_TOKEN_SECRET,
     PUT_MODE: putMode, // auto | put | post
     CHUNK_SIZE,
+    WORKER_UPLOAD_MAX_BYTES: byteLimit(e.WORKER_UPLOAD_MAX_BYTES, MAX_UPLOAD_BYTES),
+    DIRECT_UPLOAD_MAX_BYTES: Math.min(
+      byteLimit(e.DIRECT_UPLOAD_MAX_BYTES, DIRECT_UPLOAD_MAX_BYTES),
+      EDGE_UPLOAD_MAX_BYTES,
+    ),
+    MULTIPART_MAX_PART_BYTES: Math.min(
+      Math.max(
+        byteLimit(e.MULTIPART_MAX_PART_BYTES, EDGE_UPLOAD_MAX_BYTES),
+        MULTIPART_DEFAULT_PART_SIZE,
+      ),
+      EDGE_UPLOAD_MAX_BYTES,
+      OSS_MULTIPART_MAX_PART_BYTES,
+    ),
     PUBLIC_STORAGE_HOST: String(e.PUBLIC_STORAGE_HOST || "").trim().replace(/\/$/, ""),
     PUBLIC_R2_HOST: String(e.PUBLIC_R2_HOST || "").trim().replace(/\/$/, ""),
     ABUSE_REPORT_EMAIL: String(e.ABUSE_REPORT_EMAIL || "").trim(),
@@ -307,6 +335,7 @@ function apiIndex(req, url, c) {
   const storageHost = (c && c.PUBLIC_STORAGE_HOST) || origin;
   const r2Host = (c && c.PUBLIC_R2_HOST) || origin;
   const uploadHost = (c && c.PUBLIC_UPLOAD_HOST) || null;
+  const multipart = multipartLimits(c);
 
   const doc = {
     service: "Nightcord Storage",
@@ -322,6 +351,7 @@ function apiIndex(req, url, c) {
     sekaiv2: {
       direct_upload: {
         preferred: true,
+        max_file_bytes: c.DIRECT_UPLOAD_MAX_BYTES,
         steps: [
           {
             method: "POST",
@@ -345,7 +375,11 @@ function apiIndex(req, url, c) {
       },
       multipart_upload: {
         auth: "SEKAI Pass Bearer token is required to initialize multipart uploads",
-        part_size: MULTIPART_PART_SIZE,
+        default_part_size: MULTIPART_DEFAULT_PART_SIZE,
+        min_nonfinal_part_bytes: OSS_MULTIPART_MIN_PART_BYTES,
+        max_part_bytes: multipart.maxPartBytes,
+        max_parts: OSS_MULTIPART_MAX_PARTS,
+        max_file_bytes: multipart.maxObjectBytes,
         max_signed_parts_per_request: MULTIPART_SIGN_BATCH_MAX,
         steps: [
           {
@@ -401,12 +435,11 @@ function apiIndex(req, url, c) {
         example: `curl -X PUT ${origin}/v2/upload -H "X-Filename: photo.jpg" -H "Content-Type: image/jpeg" --data-binary @photo.jpg`,
         limits: {
           anonymous_max_bytes: ANON_MAX_UPLOAD_BYTES,
-          authenticated_max_bytes: MAX_UPLOAD_BYTES,
+          authenticated_max_bytes: c.WORKER_UPLOAD_MAX_BYTES,
           note:
-            "Uploads up to 512 MiB are anonymous. Larger uploads (up to ~1GB) require a " +
+            "Uploads up to 512 MiB are anonymous. Larger uploads up to the configured Worker-body limit require a " +
             "SEKAI Pass access token via 'Authorization: Bearer <token>'; without one they return 401. " +
-            "Over ~1GB returns 413. Note: Cloudflare per-plan request-body limits may cap large uploads " +
-            "below this (Free/Pro 100MB, Business 200MB, Enterprise 500MB default).",
+            "Cloudflare's per-plan request-body limit may reject the request before this Worker runs.",
         },
         auth: {
           header: "Authorization: Bearer <sekai-pass-access-token>",
@@ -554,10 +587,12 @@ function renderApiMarkdown(doc, origin) {
   lines.push("Multipart requires a SEKAI Pass Bearer token. Use it when a client needs resumable parts or a single direct upload is unsuitable.");
   lines.push("");
   lines.push("1. `POST /v2/upload/multipart/init` with `{ name, type, size, kind?, w?, h? }`.");
-  lines.push(`2. Split the file into exactly ${doc.sekaiv2.multipart_upload.part_size} byte parts (the final part may be smaller).`);
+  lines.push("2. Split the file using the returned `part_size` exactly (the final part may be smaller).");
   lines.push(`3. Batch up to ${doc.sekaiv2.multipart_upload.max_signed_parts_per_request} part numbers in POST /v2/upload/multipart/parts with the returned multipart_token, then PUT each part to its returned URL and record ETag.`);
   lines.push("4. `POST /v2/upload/multipart/complete` with `{ token: multipart_token, parts: [{ part_number, etag }] }`.");
   lines.push("5. Use `POST /v2/upload/multipart/abort` with `{ token: multipart_token }` to abandon an unfinished upload.");
+  lines.push("");
+  lines.push(`Parts default to ${doc.sekaiv2.multipart_upload.default_part_size} bytes and grow only for very large files. The gateway permits at most ${doc.sekaiv2.multipart_upload.max_part_bytes} bytes per part, ${doc.sekaiv2.multipart_upload.max_parts} parts, and ${doc.sekaiv2.multipart_upload.max_file_bytes} bytes per completed object.`);
   lines.push("");
   lines.push("The upload gateway must allow PUT and expose the `ETag` response header to browser clients.");
   lines.push("");
@@ -577,7 +612,7 @@ function renderApiMarkdown(doc, origin) {
   lines.push("");
   lines.push("**Response fields:** `uuid`, `key` (=uuid), `type`, `size` (kB), `size_bytes`, `name`, `kind`, `url`, optional `w`/`h`.");
   lines.push("");
-  lines.push("**Service size limits:** anonymous uploads up to **512 MiB**. Larger uploads (up to ~1GB) require a SEKAI Pass token via `Authorization: Bearer <token>` (else `401`); over ~1GB returns `413`. Cloudflare's per-plan request-body limit additionally applies only when file bytes use this compatibility endpoint.");
+  lines.push(`**Service size limits:** anonymous uploads up to **512 MiB**. Larger uploads up to ${doc.sekaiv2.upload.limits.authenticated_max_bytes} bytes require a SEKAI Pass token via \`Authorization: Bearer <token>\` (else \`401\`). Cloudflare's per-plan request-body limit may reject the request before this compatibility endpoint runs.`);
   lines.push("");
   lines.push("**Example:**");
   lines.push("");
@@ -814,9 +849,10 @@ function renderApiHtml(doc, origin) {
     <h3><span class="method put">POST</span>Multipart direct upload</h3>
     <ol>
       <li><code>POST /v2/upload/multipart/init</code> with JSON <code>{ name, type, size, kind?, w?, h? }</code> and a SEKAI Pass Bearer token.</li>
-      <li>Split into <code>${esc(doc.sekaiv2.multipart_upload.part_size)}</code>-byte parts, request PUT URLs in batches from <code>POST /v2/upload/multipart/parts</code>, then record every upload response <code>ETag</code>.</li>
+      <li>Split using the returned <code>part_size</code>, request PUT URLs in batches from <code>POST /v2/upload/multipart/parts</code>, then record every upload response <code>ETag</code>.</li>
       <li><code>POST /v2/upload/multipart/complete</code> with the token and <code>{ part_number, etag }</code> entries. Use <code>/multipart/abort</code> to abandon an unfinished upload.</li>
     </ol>
+    <p style="color:var(--muted);font-size:0.9rem">Default part size: <code>${esc(doc.sekaiv2.multipart_upload.default_part_size)}</code> bytes. Maximum part: <code>${esc(doc.sekaiv2.multipart_upload.max_part_bytes)}</code> bytes; maximum parts: <code>${esc(doc.sekaiv2.multipart_upload.max_parts)}</code>; maximum object: <code>${esc(doc.sekaiv2.multipart_upload.max_file_bytes)}</code> bytes.</p>
     <p style="color:var(--muted);font-size:0.9rem">The upload gateway must allow PUT and expose <code>ETag</code> to browser clients.</p>
 
     <h3>Compatibility upload</h3>
@@ -828,7 +864,7 @@ function renderApiHtml(doc, origin) {
         for uploads &gt; 512 MiB: <code>Authorization: Bearer &lt;sekai-pass-token&gt;</code>
       </td></tr>
       <tr><th>Body</th><td>raw file bytes</td></tr>
-      <tr><th>Limits</th><td>Anonymous &le; <strong>512 MiB</strong>. Larger (up to ~1GB) needs a SEKAI Pass token (else <code>401</code>); over ~1GB &rarr; <code>413</code>. Cloudflare's request-body limit also applies to this compatibility endpoint.</td></tr>
+      <tr><th>Limits</th><td>Anonymous &le; <strong>512 MiB</strong>. Larger uploads up to <code>${esc(doc.sekaiv2.upload.limits.authenticated_max_bytes)}</code> bytes need a SEKAI Pass token. Cloudflare's request-body limit may reject the request before this compatibility endpoint runs.</td></tr>
       <tr><th>Response</th><td><code>uuid</code>, <code>type</code>, <code>size</code> (kB), <code>name</code>, <code>kind</code>, <code>url</code>, optional <code>w</code>/<code>h</code></td></tr>
     </table>
     <pre>${esc(doc.sekaiv2.upload.example)}</pre>
@@ -900,11 +936,11 @@ ${esc(doc.sekaiv2.message_payload.custom_stamp)}</pre>
  * @param {string} [invalidMsg]  非法大小时的错误文案
  * @returns {Promise<Response|null>} null 表示放行；Response 表示拒绝
  */
-async function authorizeUploadSize(req, env, declaredSize, invalidMsg) {
+async function authorizeUploadSize(req, env, declaredSize, invalidMsg, maxBytes = MAX_UPLOAD_BYTES) {
   if (!Number.isFinite(declaredSize) || declaredSize < 0) {
     return fail(400, invalidMsg || "Invalid Content-Length");
   }
-  if (declaredSize > MAX_UPLOAD_BYTES) {
+  if (declaredSize > maxBytes) {
     return fail(413, "Payload Too Large");
   }
   if (declaredSize <= ANON_MAX_UPLOAD_BYTES) return null; // 匿名档：不查 D1
@@ -1216,7 +1252,13 @@ async function initSekaiV2Upload(req, c, env) {
   if (!contentType || contentType.length > 255 || /[\r\n]/.test(contentType)) {
     return fail(400, "Invalid content type");
   }
-  const sizeErr = await authorizeUploadSize(req, env, fileSize);
+  const sizeErr = await authorizeUploadSize(
+    req,
+    env,
+    fileSize,
+    undefined,
+    c.DIRECT_UPLOAD_MAX_BYTES,
+  );
   if (sizeErr) return sizeErr;
 
   const uuid = crypto.randomUUID();
@@ -1352,7 +1394,32 @@ async function completeSekaiV2Upload(req, c, ctx) {
   }, { "Cache-Control": "no-store" });
 }
 
+function multipartLimits(c) {
+  const maxPartBytes = Math.min(
+    c.MULTIPART_MAX_PART_BYTES,
+    EDGE_UPLOAD_MAX_BYTES,
+    OSS_MULTIPART_MAX_PART_BYTES,
+  );
+  const maxObjectBytes = Math.min(
+    OSS_MULTIPART_MAX_OBJECT_BYTES,
+    maxPartBytes * OSS_MULTIPART_MAX_PARTS,
+  );
+  return { maxPartBytes, maxObjectBytes };
+}
+
+function multipartPartSizeFor(fileSize, maxPartBytes) {
+  const required = Math.ceil(fileSize / OSS_MULTIPART_MAX_PARTS);
+  const roundedRequired = Math.ceil(required / MIB) * MIB;
+  const preferredPartSize = Math.min(MULTIPART_DEFAULT_PART_SIZE, maxPartBytes);
+  const partSize = Math.max(preferredPartSize, roundedRequired, OSS_MULTIPART_MIN_PART_BYTES);
+  return partSize <= maxPartBytes ? partSize : null;
+}
+
 function validMultipartPayload(c, payload) {
+  const { maxPartBytes, maxObjectBytes } = multipartLimits(c);
+  const expectedPartSize = payload && Number.isSafeInteger(payload.size)
+    ? multipartPartSizeFor(payload.size, maxPartBytes)
+    : null;
   if (
     !payload ||
     payload.v !== 3 ||
@@ -1361,11 +1428,14 @@ function validMultipartPayload(c, payload) {
     !/^[A-Za-z0-9_-]{16,256}$/.test(String(payload.uploadId || "")) ||
     !Number.isSafeInteger(payload.size) ||
     payload.size <= 0 ||
-    payload.size > MAX_UPLOAD_BYTES ||
-    payload.partSize !== MULTIPART_PART_SIZE ||
+    payload.size > maxObjectBytes ||
+    !expectedPartSize ||
+    payload.partSize !== expectedPartSize ||
+    payload.partSize < OSS_MULTIPART_MIN_PART_BYTES ||
+    payload.partSize > maxPartBytes ||
     payload.partCount !== Math.ceil(payload.size / payload.partSize) ||
     payload.partCount < 1 ||
-    payload.partCount > 10000
+    payload.partCount > OSS_MULTIPART_MAX_PARTS
   ) {
     return false;
   }
@@ -1407,14 +1477,14 @@ async function initSekaiV2MultipartUpload(req, c, env) {
   if (!Number.isSafeInteger(fileSize) || fileSize <= 0) {
     return fail(400, "Invalid size");
   }
-  if (fileSize > MAX_UPLOAD_BYTES) return fail(413, "Payload Too Large");
+  const { maxPartBytes, maxObjectBytes } = multipartLimits(c);
+  if (fileSize > maxObjectBytes) return fail(413, "Payload Too Large");
+  const partSize = multipartPartSizeFor(fileSize, maxPartBytes);
+  if (!partSize) return fail(413, "Payload Too Large");
   if (c.MULTIPART_REQUIRE_AUTH) {
     if (!(await authenticate(req, env))) {
       return fail(401, "SEKAI Pass required for multipart uploads");
     }
-  } else {
-    const sizeErr = await authorizeUploadSize(req, env, fileSize);
-    if (sizeErr) return sizeErr;
   }
 
   const uuid = crypto.randomUUID();
@@ -1448,7 +1518,7 @@ async function initSekaiV2MultipartUpload(req, c, env) {
   }
 
   const expiresAt = Math.floor(Date.now() / 1000) + DIRECT_UPLOAD_TTL_SECONDS;
-  const partCount = Math.ceil(fileSize / MULTIPART_PART_SIZE);
+  const partCount = Math.ceil(fileSize / partSize);
   const token = await createUploadToken(c, {
     v: 3,
     mode: "multipart",
@@ -1461,7 +1531,7 @@ async function initSekaiV2MultipartUpload(req, c, env) {
     ext: extOf(rawName),
     ossKey,
     uploadId,
-    partSize: MULTIPART_PART_SIZE,
+    partSize,
     partCount,
     created,
     ...(w ? { w } : {}),
@@ -1472,7 +1542,7 @@ async function initSekaiV2MultipartUpload(req, c, env) {
     uuid,
     key: uuid,
     url: sekaiPublicPath(kind, uuid),
-    part_size: MULTIPART_PART_SIZE,
+    part_size: partSize,
     part_count: partCount,
     expires_at: new Date(expiresAt * 1000).toISOString(),
     multipart_token: token,
@@ -1603,8 +1673,15 @@ async function abortSekaiV2MultipartUpload(req, c) {
     method: "DELETE",
     subresource: `uploadId=${payload.uploadId}`,
   });
-  await drain(aborted);
+  const abortBody = await aborted.text();
   if (!(aborted.ok || aborted.status === 404)) {
+    const abortCode = /<Code>([^<]+)<\/Code>/.exec(abortBody)?.[1] || "Unknown";
+    console.error(JSON.stringify({
+      message: "OSS multipart abort failed",
+      status: aborted.status,
+      code: abortCode,
+      requestId: aborted.headers.get("x-oss-request-id") || "",
+    }));
     return fail(502, "Could not abort multipart upload");
   }
   return ok({ aborted: true }, { "Cache-Control": "no-store" });
@@ -1625,7 +1702,13 @@ async function putSekaiV2(req, c, ctx, env) {
   const fSizeStr = req.headers.get("Content-Length");
   if (!fSizeStr) return fail(400);
   const fileSize = parseInt(fSizeStr, 10);
-  const sizeErr = await authorizeUploadSize(req, env, fileSize);
+  const sizeErr = await authorizeUploadSize(
+    req,
+    env,
+    fileSize,
+    undefined,
+    c.WORKER_UPLOAD_MAX_BYTES,
+  );
   if (sizeErr) return sizeErr;
 
   if (/\.\.|\/\/|[\x00-\x1f]/.test(rawName)) return fail(400);
@@ -1792,7 +1875,13 @@ async function putSafe(req, c, env) {
   const fSizeStr = req.headers.get("Content-Length");
   if (!fSizeStr) return fail(400);
   const fileSize = parseInt(fSizeStr, 10);
-  const sizeErr = await authorizeUploadSize(req, env, fileSize);
+  const sizeErr = await authorizeUploadSize(
+    req,
+    env,
+    fileSize,
+    undefined,
+    c.WORKER_UPLOAD_MAX_BYTES,
+  );
   if (sizeErr) return sizeErr;
 
   const safeId = getSafeId(safePath);
@@ -1853,7 +1942,13 @@ async function put(req, c, env) {
   const fSizeStr = req.headers.get("Content-Length");
   if (!fSizeStr) return fail(400);
   const fileSize = parseInt(fSizeStr, 10);
-  const sizeErr = await authorizeUploadSize(req, env, fileSize);
+  const sizeErr = await authorizeUploadSize(
+    req,
+    env,
+    fileSize,
+    undefined,
+    c.WORKER_UPLOAD_MAX_BYTES,
+  );
   if (sizeErr) return sizeErr;
 
   const uid = crypto.randomUUID();
@@ -1904,9 +1999,17 @@ async function putChunk(req, c, env) {
   if (isNaN(index) || isNaN(total) || isNaN(chunkSize) || isNaN(fileSize)) return fail(400);
   if (index < 0 || index >= total || total < 1 || total > 10000) return fail(400);
   // 单片本身也不能超过绝对上限（防单请求异常大）
-  if (chunkSize < 0 || chunkSize > MAX_UPLOAD_BYTES) return fail(400, "Invalid size");
+  if (chunkSize < 0 || chunkSize > c.WORKER_UPLOAD_MAX_BYTES) {
+    return fail(400, "Invalid size");
+  }
   // 按**总文件**大小分档鉴权：> 512 MiB 的整体上传每片都要带 SEKAI Pass
-  const sizeErr = await authorizeUploadSize(req, env, fileSize, "Invalid size");
+  const sizeErr = await authorizeUploadSize(
+    req,
+    env,
+    fileSize,
+    "Invalid size",
+    c.WORKER_UPLOAD_MAX_BYTES,
+  );
   if (sizeErr) return sizeErr;
   // Basic fileId hygiene — used in OSS keys
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(fileId)) return fail(400, "Invalid X-File-ID");
@@ -2013,7 +2116,7 @@ async function signPolicyLocal(c, userid) {
   const policyObj = {
     expiration,
     conditions: [
-      ["content-length-range", 0, MAX_UPLOAD_BYTES],
+      ["content-length-range", 0, c.WORKER_UPLOAD_MAX_BYTES],
       ["starts-with", "$key", `${c.PREFIX}/${userid}/`],
     ],
   };
