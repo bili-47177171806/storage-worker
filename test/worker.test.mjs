@@ -219,6 +219,9 @@ describe('negotiateDocsFormat', () => {
   const url = (qs = '') => new URL(`https://s.example/${qs}`);
 
   test('query 参数优先于 Accept 头', () => {
+    assert.equal(negotiateDocsFormat(req('text/html'), url('?json')), 'json');
+    assert.equal(negotiateDocsFormat(req('text/html'), url('?markdown')), 'markdown');
+    assert.equal(negotiateDocsFormat(req('text/html'), url('?md')), 'markdown');
     assert.equal(negotiateDocsFormat(req('text/html'), url('?format=json')), 'json');
     assert.equal(negotiateDocsFormat(req('text/html'), url('?format=md')), 'markdown');
     assert.equal(negotiateDocsFormat(req('text/html'), url('?format=markdown')), 'markdown');
@@ -226,15 +229,52 @@ describe('negotiateDocsFormat', () => {
 
   test('按 Accept 头协商，具体类型优先于 */*', () => {
     assert.equal(negotiateDocsFormat(req('text/markdown'), url()), 'markdown');
+    assert.equal(negotiateDocsFormat(req('text/x-markdown'), url()), 'markdown');
     assert.equal(negotiateDocsFormat(req('application/json'), url()), 'json');
+    assert.equal(negotiateDocsFormat(req('application/vnd.api+json'), url()), 'json');
     // agent 常发这种组合，应命中最具体的
     assert.equal(negotiateDocsFormat(req('text/markdown, application/json, */*'), url()), 'markdown');
+    assert.equal(negotiateDocsFormat(req('text/markdown;q=0.5, application/json'), url()), 'json');
   });
 
-  test('浏览器与空 Accept 回落到 html', () => {
+  test('浏览器回落到 html，无 Accept 回落到纯文本', () => {
     assert.equal(negotiateDocsFormat(req('text/html,*/*'), url()), 'html');
     assert.equal(negotiateDocsFormat(req('*/*'), url()), 'html');
-    assert.equal(negotiateDocsFormat(req(), url()), 'html');
+    assert.equal(negotiateDocsFormat(req('text/plain'), url()), 'text');
+    assert.equal(negotiateDocsFormat(req(), url()), 'text');
+  });
+});
+
+describe('API index representations', () => {
+  const env = {
+    OSS_BUCKET: 'bucket',
+    OSS_ENDPOINT: 'oss.example',
+    OSS_AKID: 'access-id',
+    OSS_AKS: 'access-secret',
+  };
+
+  async function fetchIndex(path = '/', headers = {}) {
+    return worker.fetch(
+      new Request(`https://s.example${path}`, { headers }),
+      env,
+      { waitUntil: () => {} },
+    );
+  }
+
+  test('returns plain text without Accept', async () => {
+    const response = await fetchIndex();
+    assert.match(response.headers.get('content-type'), /^text\/plain; charset=utf-8$/);
+    assert.match(await response.text(), /^Nightcord Storage API/);
+  });
+
+  test('supports bare JSON and Markdown query aliases', async () => {
+    const json = await fetchIndex('?json');
+    assert.match(json.headers.get('content-type'), /^application\/json;charset=utf-8$/);
+    assert.equal((await json.json()).service, 'Nightcord Storage');
+
+    const markdown = await fetchIndex('?markdown');
+    assert.match(markdown.headers.get('content-type'), /^text\/markdown; charset=utf-8$/);
+    assert.match(await markdown.text(), /^# Nightcord Storage/);
   });
 });
 

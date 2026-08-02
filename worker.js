@@ -329,26 +329,64 @@ export default {
  * ═══════════════════════════════════════════════════════ */
 
 /**
- * Negotiate docs representation from Accept / ?format=
- * Priority: explicit ?format= > Accept q-order heuristics
- * - markdown: text/markdown (agents)
- * - json: application/json
- * - html: default for browsers
+ * Negotiate docs representation from explicit query aliases and Accept.
+ * Priority: bare query alias > legacy ?format= > Accept > text/plain.
  */
 function negotiateDocsFormat(req, url) {
+  if (url.searchParams.has("json")) return "json";
+  if (url.searchParams.has("markdown") || url.searchParams.has("md")) return "markdown";
+
   const fmt = (url.searchParams.get("format") || "").toLowerCase();
   if (fmt === "md" || fmt === "markdown") return "markdown";
   if (fmt === "json") return "json";
   if (fmt === "html") return "html";
 
-  const accept = (req.headers.get("Accept") || "").toLowerCase();
-  // Prefer the most specific agent / API types before */* or html
-  if (accept.includes("text/markdown")) return "markdown";
-  if (accept.includes("application/json")) return "json";
-  if (accept.includes("text/html")) return "html";
-  // Agents sometimes send Accept: text/markdown, application/json, */*
-  // Already handled. Bare */* or empty → HTML for browsers.
-  return "html";
+  const accept = req.headers.get("Accept");
+  if (!accept || !accept.trim()) return "text";
+
+  const accepted = accept
+    .toLowerCase()
+    .split(",")
+    .map((entry, index) => {
+      const parts = entry.trim().split(";");
+      const mediaType = parts.shift()?.trim() || "";
+      let quality = 1;
+      for (const parameter of parts) {
+        const [name, value] = parameter.trim().split("=");
+        if (name === "q") quality = Number(value);
+      }
+      return {
+        mediaType,
+        quality,
+        index,
+        specificity: mediaType === "*/*" ? 0 : mediaType.includes("*") ? 1 : 2,
+      };
+    })
+    .filter((entry) => entry.mediaType && Number.isFinite(entry.quality) && entry.quality > 0)
+    .sort((left, right) =>
+      right.quality - left.quality ||
+      right.specificity - left.specificity ||
+      left.index - right.index,
+    );
+
+  for (const { mediaType } of accepted) {
+    if (
+      mediaType === "text/markdown" ||
+      mediaType === "text/x-markdown" ||
+      mediaType === "application/markdown"
+    ) return "markdown";
+    if (
+      mediaType === "application/json" ||
+      mediaType === "application/*+json" ||
+      mediaType.endsWith("+json") ||
+      mediaType === "application/*"
+    ) return "json";
+    if (mediaType === "text/plain" || mediaType === "text/*") return "text";
+    if (mediaType === "text/html" || mediaType === "application/xhtml+xml") return "html";
+    if (mediaType === "*/*") return "html";
+  }
+
+  return "text";
 }
 
 /** Rough token estimate for x-markdown-tokens (whitespace-split). */
@@ -539,8 +577,8 @@ function apiIndex(req, url, c) {
     },
     links: {
       self_html: origin + "/",
-      self_json: origin + "/?format=json",
-      self_markdown: origin + "/?format=md",
+      self_json: origin + "/?json",
+      self_markdown: origin + "/?markdown",
       sekaiv2_docs: origin + "/v2",
       accept_markdown: "Send Accept: text/markdown for this document as Markdown (agents).",
     },
@@ -576,6 +614,16 @@ function apiIndex(req, url, c) {
     });
   }
 
+  if (format === "text") {
+    return new Response(req.method === "HEAD" ? null : renderApiText(doc, origin), {
+      status: 200,
+      headers: {
+        ...commonHeaders,
+        "Content-Type": "text/plain; charset=utf-8",
+      },
+    });
+  }
+
   // HTML default (browsers)
   return new Response(req.method === "HEAD" ? null : renderApiHtml(doc, origin), {
     status: 200,
@@ -584,6 +632,35 @@ function apiIndex(req, url, c) {
       "Content-Type": "text/html;charset=utf-8",
     },
   });
+}
+
+function renderApiText(doc, origin) {
+  return [
+    `${doc.service} API`,
+    `Version: ${doc.version}`,
+    "",
+    doc.description,
+    "",
+    "Hosts:",
+    `Storage: ${doc.hosts.storage}`,
+    `R2: ${doc.hosts.r2}`,
+    `Upload: ${doc.hosts.upload || "not configured"}`,
+    "",
+    "Primary endpoints:",
+    "POST /v2/upload/init",
+    "POST /v2/upload/complete",
+    "POST /v2/upload/multipart/init",
+    "POST /v2/upload/multipart/complete",
+    "GET|HEAD /images/{uuid} | /files/{uuid} | /stickers/{uuid}",
+    "GET /v2/meta/{uuid}",
+    "",
+    "Representations:",
+    `HTML: ${origin}/ (Accept: text/html)`,
+    `JSON: ${origin}/?json (also ?format=json; Accept: application/json)`,
+    `Markdown: ${origin}/?markdown or ${origin}/?md (Accept: text/markdown)`,
+    "Plain text: returned when the request has no Accept header",
+    "",
+  ].join("\n");
 }
 
 /**
@@ -700,9 +777,10 @@ function renderApiMarkdown(doc, origin) {
   lines.push("");
   lines.push(`| Format | How |`);
   lines.push(`|--------|-----|`);
-  lines.push(`| HTML (default) | \`${origin}/\` |`);
-  lines.push(`| JSON | \`${origin}/?format=json\` or \`Accept: application/json\` |`);
-  lines.push(`| Markdown | \`${origin}/?format=md\` or \`Accept: text/markdown\` |`);
+  lines.push(`| HTML | \`${origin}/\` with \`Accept: text/html\` |`);
+  lines.push(`| Plain text | No \`Accept\` header |`);
+  lines.push(`| JSON | \`${origin}/?json\` or \`Accept: application/json\` |`);
+  lines.push(`| Markdown | \`${origin}/?markdown\`, \`${origin}/?md\`, or \`Accept: text/markdown\` |`);
   lines.push("");
   lines.push("Markdown responses use `Content-Type: text/markdown` and `x-markdown-tokens`.");
   lines.push("");
@@ -930,14 +1008,16 @@ ${esc(doc.sekaiv2.message_payload.custom_stamp)}</pre>
   <section>
     <h2>Machine-readable / agents</h2>
     <p>
-      <a href="${esc(origin)}/?format=json"><code>GET /?format=json</code></a>
-      · <a href="${esc(origin)}/?format=md"><code>GET /?format=md</code></a>
+      <a href="${esc(origin)}/?json"><code>GET /?json</code></a>
+      · <a href="${esc(origin)}/?markdown"><code>GET /?markdown</code></a>
+      · <a href="${esc(origin)}/?md"><code>GET /?md</code></a>
       · <a href="${esc(origin)}/v2"><code>/v2</code></a>
     </p>
     <ul>
       <li><code>Accept: application/json</code> → JSON</li>
       <li><code>Accept: text/markdown</code> → Markdown (<code>Content-Type: text/markdown</code>, <code>x-markdown-tokens</code>)</li>
-      <li>Default / browsers → HTML</li>
+      <li><code>Accept: text/html</code> → HTML</li>
+      <li>No <code>Accept</code> header → <code>text/plain</code></li>
     </ul>
   </section>
 
